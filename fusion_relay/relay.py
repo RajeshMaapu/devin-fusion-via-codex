@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import auth
+from . import auth, catalog
 from .translate import (UnsupportedRequest, call_codex, packet_to_responses_body,
                         parse_routed_model)
 from .wire import Message, decode, error_frame, iter_frames, text, unframe
@@ -287,6 +287,11 @@ class Handler(BaseHTTPRequestHandler):
         rec: dict = {"rpc": self.path}
 
         if not self.path.endswith("/GetChatMessage"):
+            if self.path.endswith("/AssignModel") or \
+                    self.path.endswith("/AssignModelStarting"):
+                body, pinned = catalog.rewrite_assign(body)
+                if pinned:
+                    rec["session_route"] = pinned
             status, out, ctype = _forward(body, self.headers, self.path)
             rec.update(route="forward", upstream_status=status,
                        ms=round((time.time() - started) * 1000))
@@ -294,6 +299,9 @@ class Handler(BaseHTTPRequestHandler):
                 rec["request_numbers"] = _peek_numbers(body)
                 rec["request_head"] = body[:16].hex()
                 rec["request_encoding"] = self.headers.get("Content-Encoding")
+            if self.path.endswith("/GetCliModelConfigs"):
+                out, n_injected = catalog.inject_route_entries(out)
+                rec["injected_models"] = n_injected
             if "AssignModel" in self.path or "ModelConfig" in self.path:
                 rec["response_models"] = _peek_models(out)
             if self.path.endswith("/GetUserStatus"):
@@ -313,6 +321,11 @@ class Handler(BaseHTTPRequestHandler):
         rec["model"] = model
         rec["n_messages"] = len(packet.get(3, []))
         route = route_for_model(model)
+        pinned = catalog.session_route(packet)
+        if route == "codex" and pinned == "native":
+            # Session explicitly picked a `…-native` selector in /model.
+            route = "forward"
+            rec["session_route"] = "native"
 
         if route == "forward":
             status, out, ctype = _forward(body, self.headers, self.path)

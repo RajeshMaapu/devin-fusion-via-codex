@@ -14,7 +14,7 @@ from fusion_relay.relay import route_for_model
 from fusion_relay.translate import (UnsupportedRequest,
                                     packet_to_responses_body,
                                     parse_routed_model)
-from fusion_relay import translate
+from fusion_relay import catalog, translate
 
 
 class WireCodecTest(unittest.TestCase):
@@ -179,6 +179,75 @@ class FinalMessageTest(unittest.TestCase):
         self.assertEqual(decoded[5][0], translate.FINISH_TOOL_CALLS)
         tc = wire.decode(decoded[6][0])  # type: ignore[arg-type]
         self.assertEqual(wire.text(tc, 2), "t")
+
+
+
+
+class CatalogTest(unittest.TestCase):
+    """Catalog injection + AssignModel rewrite + session pinning."""
+
+    def _entry(self, model_id: str, name: str = "A Model") -> bytes:
+        inner = wire.field(17, model_id)
+        badges = wire.field(1, "Fam") + wire.field(2, wire.field(1, "Effort")
+                                                 + wire.field(2, wire.field(2, "High")
+                                                              + wire.field(3, 1)))
+        e = (wire.field(1, name) + wire.field(22, model_id)
+             + wire.field(23, inner) + wire.field(30, badges))
+        return wire.field(1, e)  # top-level repeated field 1
+
+    def test_inject_adds_codex_and_native_clones(self) -> None:
+        body = self._entry("gpt-6-astra-high", "GPT-6 Astra High Thinking")
+        body += self._entry("fusion-gpt-6-astra-high-sidekick-swe-2-medium", "Fusion A/S")
+        body += self._entry("claude-opus-5-medium", "Opus")  # not cloneable
+        out, n = catalog.inject_route_entries(body)
+        self.assertEqual(n, 4)  # 2 cloneable entries x 2 routes
+        top = wire.decode_typed(out)
+        ids = [wire.get_string(wire.decode_typed(v), 22)
+               for v, w in top[1] if w == 2]
+        self.assertIn("gpt-6-astra-high-codex", ids)
+        self.assertIn("gpt-6-astra-high-native", ids)
+        self.assertIn("fusion-gpt-6-astra-high-sidekick-swe-2-medium-codex", ids)
+        self.assertNotIn("claude-opus-5-medium-codex", ids)
+        names = [wire.get_string(wire.decode_typed(v), 1)
+                 for v, w in top[1] if w == 2]
+        self.assertIn("GPT-6 Astra High Thinking · Codex sub", names)
+
+    def test_inject_on_garbage_returns_input(self) -> None:
+        self.assertEqual(catalog.inject_route_entries(b"\xff\xff"), (b"\xff\xff", 0))
+
+    def test_rewrite_assign_codex(self) -> None:
+        catalog.reset()
+        req = (wire.field(2, "fusion-gpt-6-astra-high-sidekick-swe-2-medium-codex")
+               + wire.field(3, "sess-uuid-1"))
+        new_body, route = catalog.rewrite_assign(req)
+        msg = wire.decode(new_body)
+        self.assertEqual(wire.text(msg, 2),
+                         "fusion-gpt-6-astra-high-sidekick-swe-2-medium")
+        self.assertEqual(route, "codex")
+        # session pinned
+        packet = wire.decode(wire.field(16, "sess-uuid-1"))
+        self.assertEqual(catalog.session_route(packet), "codex")
+
+    def test_rewrite_assign_native_pin(self) -> None:
+        catalog.reset()
+        req = wire.field(2, "gpt-6-astra-high-native") + wire.field(3, "u2")
+        _, route = catalog.rewrite_assign(req)
+        self.assertEqual(route, "native")
+        packet = wire.decode(wire.field(16, "u2"))
+        self.assertEqual(catalog.session_route(packet), "native")
+
+    def test_unsuffixed_selector_untouched(self) -> None:
+        catalog.reset()
+        req = wire.field(2, "gpt-6-astra-high") + wire.field(3, "u3")
+        new_body, route = catalog.rewrite_assign(req)
+        self.assertIsNone(route)
+        self.assertEqual(wire.decode(new_body)[2], wire.decode(req)[2])
+
+    def test_encode_typed_roundtrip(self) -> None:
+        raw = (wire.field(1, "x") + wire.field(5, 42)
+               + wire.varint(3 << 3 | 5) + b"ABCD")  # fixed32
+        typed = wire.decode_typed(raw)
+        self.assertEqual(wire.encode_typed(typed), raw)
 
 
 if __name__ == "__main__":

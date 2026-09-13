@@ -118,6 +118,86 @@ def iter_frames(buf: bytes) -> list[tuple[int, bytes]]:
     return frames
 
 
+TypedMessage = dict[int, list[tuple[FieldValue, int]]]
+
+
+def decode_typed(buf: bytes) -> TypedMessage:
+    """Decode like :func:`decode` but keep each field's wire type.
+
+    Values: wire type 0 -> int, types 1/2/5 -> bytes. Re-encode with
+    :func:`encode_typed` to round-trip losslessly (fixed32/64 stay fixed).
+    """
+    out: TypedMessage = {}
+    pos = 0
+
+    def read_varint() -> int:
+        nonlocal pos
+        n = 0
+        shift = 0
+        while pos < len(buf):
+            byte = buf[pos]
+            pos += 1
+            n |= (byte & 127) << shift
+            if byte < 128:
+                return n
+            shift += 7
+            if shift > 70:
+                raise ValueError("varint too long")
+        raise ValueError("truncated varint")
+
+    while pos < len(buf):
+        tag = read_varint()
+        number, wire_type = tag >> 3, tag & 7
+        if not number:
+            raise ValueError("field number zero")
+        if wire_type == 0:
+            value: FieldValue = read_varint()
+        elif wire_type == 2:
+            length = read_varint()
+            value = buf[pos : pos + length]
+            pos += length
+        elif wire_type in (1, 5):
+            length = 8 if wire_type == 1 else 4
+            value = buf[pos : pos + length]
+            pos += length
+        else:
+            raise ValueError(f"unsupported wire type {wire_type}")
+        if pos > len(buf):
+            raise ValueError("truncated field")
+        out.setdefault(number, []).append((value, wire_type))
+    return out
+
+
+def encode_typed(msg: TypedMessage) -> bytes:
+    """Re-encode a :func:`decode_typed` message preserving wire types."""
+    out = bytearray()
+    for number, fields_ in msg.items():  # dict preserves wire order
+        for value, wire_type in fields_:
+            if wire_type == 0:
+                out += varint(number << 3) + varint(int(value))
+            elif wire_type == 2:
+                raw = value if isinstance(value, bytes) else str(value).encode()
+                out += varint(number << 3 | 2) + varint(len(raw)) + raw
+            else:
+                raw = bytes(value)
+                out += varint(number << 3 | wire_type) + raw
+    return bytes(out)
+
+
+def set_string(msg: TypedMessage, number: int, value: str) -> None:
+    """Replace-or-set a string field on a typed message."""
+    msg[number] = [(value.encode(), 2)]
+
+
+def get_string(msg: TypedMessage, number: int, default: str = "") -> str:
+    """Read a string field from a typed message."""
+    vals = msg.get(number)
+    if not vals:
+        return default
+    v = vals[0][0]
+    return v.decode() if isinstance(v, bytes) else default
+
+
 def text(msg: Message, number: int, default: str = "") -> str:
     """Read a string field from a decoded message."""
     value = msg.get(number, [default.encode()])[0]

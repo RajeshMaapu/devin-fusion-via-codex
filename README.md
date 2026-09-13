@@ -29,6 +29,24 @@ codex login                          # ChatGPT account, if not already
 execs `devin` unchanged — select any `fusion-gpt-6-astra-*-sidekick-swe-2-*`
 model as usual (`--model`, `/model`, or `DEVIN_MODEL`).
 
+### `/model` picker entries
+
+Under the relay the model picker gains two labeled clones of every
+`gpt-6-astra*` / `fusion-gpt-6-astra*` entry (≈140 injected):
+
+- `… · Codex sub` — id suffix `-codex`. Explicit subscription route
+  (identical to the default under the relay; the label makes it visible).
+- `… · Native` — id suffix `-native`. Per-session escape hatch back to
+  Cognition-billed Astra without restarting `devin`.
+
+Mechanics: the picker sends the suffixed id in `AssignModel` field 2 → the
+relay strips the suffix (Cognition only knows canonical ids), pins the
+session uuid → `GetChatMessage` field 16 carries the same uuid and honors the
+pin. Verified live: `-native` pins forward to Cognition, `-codex`/unpinned go
+to Codex. Caveat: `--model <injected-id>` on the command line can't resolve
+injected ids (fuzzy match runs before the catalog loads) — use `/model` in
+the UI or the canonical names.
+
 ```bash
 ~/projects/fusion-codex-relay/bin/fusion-relay stats    # route counters
 ~/projects/fusion-codex-relay/bin/fusion-relay stop
@@ -48,6 +66,9 @@ model as usual (`--model`, `/model`, or `DEVIN_MODEL`).
 | `devin -p` print path | Works (same override) |
 | Prompt cache | `cached_tokens` observed flowing Codex → CLI `cachedReadTokens` |
 | Usage display | CLI `usage_update` mirrors the Codex token counts exactly |
+| `/model` route entries | 140 `-codex`/`-native` clones injected; `AssignModel` rewrite + session pin verified |
+| Quota wall bypass | Relayed astra turn completes on a Cognition-quota-exhausted account |
+| Always-on | launchd agent `ai.maapu.fusion-relay` (RunAtLoad + KeepAlive) |
 
 ## Usage accounting — what actually happens
 

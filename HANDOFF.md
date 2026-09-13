@@ -40,6 +40,27 @@ daily-quota enforcement lives on the `GetChatMessage` path we bypass).
 Verified: on the same exhausted-quota account, a relayed Fusion turn completed
 normally (Codex HTTP 200).
 
+### Selecting the route in `/model`
+
+Under `devin-fusion`, `/model` lists every `gpt-6-astra*` /
+`fusion-gpt-6-astra*` entry twice more with labels:
+
+- `… · Codex sub` (`*-codex`) — explicit subscription route
+- `… · Native` (`*-native`) — per-session escape hatch to Cognition Astra
+
+The relay strips the suffix in `AssignModel` (Cognition only knows canonical
+ids), pins `session_uuid → route` (AssignModel field 3 == GetChatMessage
+field 16), and honors `native` per session. Caveat: `--model <suffixed-id>`
+can't resolve injected entries — fuzzy matching runs before the catalog
+loads; use the picker or canonical names.
+
+### Always-on relay
+
+`~/Library/LaunchAgents/ai.maapu.fusion-relay.plist` — RunAtLoad + KeepAlive
+on crash, logs to `~/.local/share/fusion-codex-relay/launchd.log`.
+Manage: `launchctl kickstart -k gui/$(id -u)/ai.maapu.fusion-relay` (restart),
+`launchctl bootout gui/$(id -u)/ai.maapu.fusion-relay` (unload).
+
 ## File map
 
 | Path | Role |
