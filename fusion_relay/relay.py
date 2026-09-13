@@ -76,6 +76,13 @@ def _log_record(rec: dict) -> None:
         _stats["requests"] += 1
         route = rec.get("route", "?")
         _stats["by_route"][route] = _stats["by_route"].get(route, 0) + 1
+        usage = rec.get("codex_usage")
+        if usage:
+            tok = _stats["tokens"]["codex"]
+            tok["input"] = tok.get("input", 0) + usage.get("input_tokens", 0)
+            tok["output"] = tok.get("output", 0) + usage.get("output_tokens", 0)
+            cached = usage.get("input_tokens_details", {}).get("cached_tokens", 0)
+            tok["cached"] = tok.get("cached", 0) + cached
 
 
 def route_for_model(model: str) -> str:
@@ -94,6 +101,32 @@ def _peek_user_status(raw: bytes) -> dict:
     """
     return {k: v[0] if len(v) == 1 else v
             for k, v in _peek_numbers(raw).items()}
+
+
+def _peek_chat_usage(raw: bytes) -> dict:
+    """Read the usage submessage from a forwarded GetChatMessage stream."""
+    try:
+        frames = iter_frames(raw)
+    except ValueError:
+        return {}
+    for flags, payload in reversed(frames):
+        if flags & 0x02:
+            continue
+        try:
+            msg = decode(payload)
+        except ValueError:
+            continue
+        usage_field = msg.get(7)
+        if not usage_field:
+            continue
+        try:
+            usage = decode(usage_field[0])  # type: ignore[arg-type]
+        except ValueError:
+            continue
+        return {"input": usage.get(2, [0])[0],
+                "output": usage.get(3, [0])[0],
+                "cached": usage.get(5, [0])[0]}
+    return {}
 
 
 def _peek_numbers(raw: bytes) -> dict:
@@ -285,6 +318,13 @@ class Handler(BaseHTTPRequestHandler):
             status, out, ctype = _forward(body, self.headers, self.path)
             rec.update(route="cognition-forward", upstream_status=status,
                        ms=round((time.time() - started) * 1000))
+            usage = _peek_chat_usage(out)
+            if usage:
+                rec["cognition_usage"] = usage
+                with _stats_lock:
+                    tok = _stats["tokens"]["cognition"]
+                    tok["input"] = tok.get("input", 0) + usage.get("input", 0)
+                    tok["output"] = tok.get("output", 0) + usage.get("output", 0)
             _log_record(rec)
             return self._send(status, out, ctype)
 
