@@ -42,17 +42,30 @@ normally (Codex HTTP 200).
 
 ### Selecting the route in `/model`
 
-Under `devin-fusion`, `/model` lists every `gpt-6-astra*` /
-`fusion-gpt-6-astra*` entry twice more with labels:
+Under `devin-fusion` the relay rewrites `GetCliModelConfigs` so the picker
+shows the route honestly on the entries you already know:
 
-- `… · Codex sub` (`*-codex`) — explicit subscription route
-- `… · Native` (`*-native`) — per-session escape hatch to Cognition Astra
+- Canonical `gpt-6-astra*` / `fusion-gpt-6-astra*` entries are **relabeled in
+  place** with a `· Codex sub` suffix — picking the normal entry IS the
+  subscription route.
+- One `…-native` clone per entry is appended (`… · Native` label) — a
+  per-session escape hatch back to Cognition-billed Astra.
 
-The relay strips the suffix in `AssignModel` (Cognition only knows canonical
-ids), pins `session_uuid → route` (AssignModel field 3 == GetChatMessage
-field 16), and honors `native` per session. Caveat: `--model <suffixed-id>`
-can't resolve injected entries — fuzzy matching runs before the catalog
-loads; use the picker or canonical names.
+Mechanics: picking a `-native` id sends it in `AssignModel` field 2 → the
+relay strips the suffix (Cognition only knows canonical ids), pins
+`session_uuid → route` (AssignModel field 3 == GetChatMessage field 16), and
+honors `native` for that session. Caveat: `--model`/`DEVIN_MODEL` can't
+resolve `-native` ids — fuzzy matching runs before the catalog loads; use
+the `/model` picker or canonical names on the CLI.
+
+### Global default model
+
+`~/.config/devin/config.json` now sets
+`agent.model = fusion-gpt-6-astra-high-sidekick-swe-2-medium` (backup:
+`config.json.fusion-relay-backup`). Consequence: **plain `devin` also
+defaults to fusion-astra but bypasses the relay** — it will hit the native
+Cognition quota. Run sessions through `devin-fusion` while quota is
+exhausted.
 
 ### Always-on relay
 
@@ -71,7 +84,8 @@ Manage: `launchctl kickstart -k gui/$(id -u)/ai.maapu.fusion-relay` (restart),
 | `fusion_relay/relay.py` | `ThreadingHTTPServer` on 127.0.0.1; routing table, verbatim forwarder, delta/buffer streaming, JSONL accounting, `/healthz` `/stats` |
 | `bin/fusion-relay` | start/stop/status/stats/fg process manager |
 | `bin/devin-fusion` | devin launcher with the override |
-| `tests/test_relay.py` | 18 unit tests: codec, routing table, translation, finish reasons |
+| `fusion_relay/catalog.py` | `GetCliModelConfigs` rewrite: relabel astra/fusion-astra entries `· Codex sub`, append `-native` clones; `AssignModel` suffix strip + `session_uuid → route` pinning |
+| `tests/test_relay.py` | 24 unit tests: codec, routing table, translation, catalog injection/relabel, assign rewrite, session pinning, finish reasons |
 
 Runtime state (never committed): `~/.local/share/fusion-codex-relay/` —
 `requests.jsonl` (per-request sanitized records), `relay.log`, `relay.pid`.
@@ -101,6 +115,11 @@ reasoning.effort, stream, store:false, prompt_cache_key}`.
 - `devin acp` and `devin -p` both work; `session/load` resume + recall verified
 - Prompt cache hits observed (`cached_tokens` → CLI `cachedReadTokens`)
 - Quota-exhausted Cognition account: relayed astra turn still completes
+- LaunchAgent (launchd `ai.maapu.fusion-relay`) keeps relay up across logins
+- Config default `fusion-…-swe-2-medium` honored with no `--model` flag;
+  lead `gpt-6-astra-high` → Codex ×6, sidekick `swe-2-medium` → Cognition ×2,
+  aux `swe-1-6-fast` → Cognition — real task (fizzbuzz + tests + sidekick
+  review) completed green end-to-end
 
 ## Usage accounting — the honest picture
 
@@ -117,8 +136,9 @@ reasoning.effort, stream, store:false, prompt_cache_key}`.
 - Opaque reasoning items are not threaded between turns; long sessions
   re-derive context from message history.
 - Mid-stream cancellation is best-effort; upstream unwinds on timeout.
-- Relay is a per-login process — to have it always up, a LaunchAgent can be
-  added later (not installed; would need your approval).
+- The TUI `/model` picker may filter catalog entries by entitlement; the
+  `· Codex sub` relabel keeps canonical ids so picker filtering is unaffected
+  — only display names change.
 - Compatibility depends on undocumented Devin and Codex protocol details;
   a Devin update can change wire fields without notice.
 - ChatGPT-subscription inference via a local login is the same model the
@@ -142,5 +162,5 @@ needs: launch `devin acp --model fusion-…` with
 ## Tests
 
 ```bash
-cd ~/projects/fusion-codex-relay && python3 -m unittest tests.test_relay   # 18 tests
+cd ~/projects/fusion-codex-relay && python3 -m unittest tests.test_relay   # 24 tests
 ```
