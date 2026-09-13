@@ -178,11 +178,15 @@ def rewrite_assign(body: bytes) -> tuple[bytes, str, str]:
     except ValueError:
         return body, "", ""
     selector = get_string(msg, F_ASSIGN_SELECTOR)
-    if not selector.endswith(NATIVE_SUFFIX):
-        return body, "", ""
-    set_string(msg, F_ASSIGN_SELECTOR, selector[: -len(NATIVE_SUFFIX)])
     session = get_string(msg, F_ASSIGN_SESSION)
-    return encode_typed(msg), session, "native"
+    if selector.endswith(NATIVE_SUFFIX):
+        set_string(msg, F_ASSIGN_SELECTOR, selector[: -len(NATIVE_SUFFIX)])
+        return encode_typed(msg), session, "native"
+    if CLONEABLE_RE.match(selector.encode()):
+        # Canonical `· Codex sub` row picked while a native pin may exist —
+        # an explicit re-pin so the stale route cannot silently survive.
+        return body, session, "codex"
+    return body, "", ""
 
 
 def pin_route(session: str, route: str) -> None:

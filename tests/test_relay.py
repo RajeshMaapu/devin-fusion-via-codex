@@ -626,10 +626,22 @@ class CatalogTest(unittest.TestCase):
         self.assertEqual(catalog.session_route(packet), "native")
 
     def test_unsuffixed_selector_untouched(self) -> None:
-        req = wire.field(2, "gpt-6-astra-high") + wire.field(3, "u3")
+        req = wire.field(2, "swe-2-medium") + wire.field(3, "u3")
         new_body, session, route = catalog.rewrite_assign(req)
         self.assertEqual((session, route), ("", ""))
         self.assertEqual(wire.decode(new_body)[2], wire.decode(req)[2])
+
+    def test_canonical_pick_repins_codex_over_native(self) -> None:
+        # native pin first, then canonical select must clear it
+        catalog.pin_route("u4", "native")
+        req = wire.field(2, "gpt-6-astra-high") + wire.field(3, "u4")
+        new_body, session, route = catalog.rewrite_assign(req)
+        self.assertEqual((session, route), ("u4", "codex"))
+        # body untouched — canonical id is what Cognition knows
+        self.assertEqual(wire.text(wire.decode(new_body), 2), "gpt-6-astra-high")
+        catalog.pin_route(session, route)
+        packet = wire.decode(wire.field(16, "u4"))
+        self.assertEqual(catalog.session_route(packet), "codex")
 
     def test_pins_persist_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as d:
