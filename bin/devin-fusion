@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Launch `devin` with inference routed through the local fusion-codex relay.
+# Starts the relay if it isn't running, then execs devin with the endpoint
+# override. All other devin arguments pass through unchanged.
+#
+#   devin-fusion                 # normal TUI session
+#   devin-fusion acp             # ACP session (Workshop/IDE path)
+#   devin-fusion --help          # etc.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$HERE/..${PYTHONPATH:+:$PYTHONPATH}"
+PORT="${FUSION_RELAY_PORT:-8931}"
+
+if ! curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    "$HERE/fusion-relay" start "$PORT" >&2
+fi
+
+export WINDSURF_API_SERVER_URL="http://127.0.0.1:$PORT"
+exec devin "$@"

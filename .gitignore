@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.scratch/
+requests.jsonl
+relay.log
+relay.pid
+*.bin
+.DS_Store
