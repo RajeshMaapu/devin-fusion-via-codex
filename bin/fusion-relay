@@ -42,11 +42,14 @@ case "${1:-status}" in
         rm -f "$PIDFILE"
         ;;
     fg) exec python3 -m fusion_relay.relay "$PORT" ;;
-    stats) curl -sf "http://127.0.0.1:$PORT/stats" || echo "relay not reachable on :$PORT" ;;
+    stats)
+        TOKEN="$(cat "$DATA_DIR/relay-token" 2>/dev/null | tr -d '[:space:]')"
+        curl -sf "http://127.0.0.1:$PORT/t/$TOKEN/stats" || echo "relay not reachable on :$PORT" ;;
     status)
         if pid="$(relay_pid)"; then
             echo "running (pid $pid, port $PORT)"
-            curl -sf "http://127.0.0.1:$PORT/stats" || true
+            TOKEN="$(cat "$DATA_DIR/relay-token" 2>/dev/null | tr -d '[:space:]')"
+            curl -sf "http://127.0.0.1:$PORT/t/$TOKEN/stats" || true
         else
             echo "not running"
         fi

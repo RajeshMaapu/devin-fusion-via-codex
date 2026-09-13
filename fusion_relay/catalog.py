@@ -1,31 +1,38 @@
 """Catalog injection and per-session route pinning.
 
-Adds labeled ``-codex`` / ``-native`` clones of every ``gpt-6-astra*`` and
-``fusion-gpt-6-astra*`` entry to the ``GetCliModelConfigs`` response, so the
-CLI's ``/model`` picker shows the Codex-subscription route as a real choice.
+Relabels every ``gpt-6-astra*`` / ``fusion-gpt-6-astra*`` entry in the
+``GetCliModelConfigs`` response with a ``· Codex sub`` marker (the canonical
+id IS the Codex route under the relay) and appends one ``-native`` clone per
+entry as the in-picker escape hatch back to Cognition-billed Astra.
 
 Selection flow:
 
 1. ``/model`` shows e.g. ``GPT-6 Astra High Thinking · Codex sub``.
-2. ``AssignModel`` arrives with the suffixed selector in field 2; the relay
-   strips the suffix before Cognition sees it (Cognition only knows the
-   canonical ids) and records ``session_uuid -> route``.
+2. ``AssignModel`` arrives with a ``-native`` selector in field 2; the relay
+   strips the suffix before Cognition sees it (Cognition only knows canonical
+   ids). The pin is committed ONLY after upstream accepts the assignment —
+   a failed selection leaves the previous route intact.
 3. ``GetChatMessage`` carries the same session uuid in field 16; an astra
    packet consults the map — ``native`` forwards to Cognition, anything else
    takes the Codex route (the relay's default anyway).
+
+Pins persist to ``routes.json`` under the data dir so a relay restart does
+not silently reroute an existing session.
 """
 
 from __future__ import annotations
 
+import json
+import pathlib
 import re
 import threading
 
-from .wire import (decode, decode_typed, encode_typed, field, get_string,
-                   set_string)
+from .wire import (decode_typed, encode_typed, field, get_string, set_string)
 
-# Selectors that get labeled route clones in the picker.
+# Selectors that get the Codex-route relabel + a ``-native`` clone.
 CLONEABLE_RE = re.compile(rb"^(?:fusion-)?gpt-6-astra")
-CODEX_SUFFIX = "-codex"
+# Any astra-family id not covered above is a protocol-drift warning.
+ASTRA_LIKE_RE = re.compile(rb"astra")
 NATIVE_SUFFIX = "-native"
 
 # Catalog entry layout (decoded from a live GetCliModelConfigs response):
@@ -42,6 +49,32 @@ F_ASSIGN_SESSION = 3   # session uuid — equals GetChatMessage field 16
 
 _lock = threading.Lock()
 _session_routes: dict[str, str] = {}  # session uuid -> "codex" | "native"
+_store_path: pathlib.Path | None = None
+
+
+def attach_store(path: pathlib.Path) -> None:
+    """Persist route pins under *path*; loads any pins from a prior run."""
+    global _store_path
+    with _lock:
+        _store_path = path
+        try:
+            saved = json.loads(path.read_text())
+        except (OSError, ValueError):
+            saved = {}
+        for k, v in saved.items():
+            if v in ("codex", "native"):
+                _session_routes[k] = v
+
+
+def _save_locked() -> None:
+    if _store_path is None:
+        return
+    tmp = _store_path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(_session_routes))
+        tmp.replace(_store_path)
+    except OSError:
+        pass
 
 
 def _badge(label: str, value: str) -> bytes:
@@ -74,31 +107,38 @@ def _clone_entry(raw: bytes, suffix: str, badge_text: str) -> bytes | None:
     return encode_typed(entry)
 
 
-def inject_route_entries(body: bytes) -> tuple[bytes, int]:
+def inject_route_entries(body: bytes) -> tuple[bytes, int, list[str]]:
     """Relabel astra entries as Codex-routed; append ``-native`` clones.
 
-    Under the relay every ``gpt-6-astra*`` / ``fusion-gpt-6-astra*`` selection
-    is served by the Codex subscription, so the base display name gets a
-    truthful "· Codex sub" suffix and a Route badge. A ``-native`` clone per
-    entry provides the in-UI escape hatch back to Cognition-billed Astra.
-
-    Returns ``(new_body, injected_count)``.
+    Returns ``(new_body, injected_count, warnings)`` — warnings flag
+    astra-family ids the relabel didn't cover and per-entry clone failures,
+    i.e. protocol drift surfacing before it silently misroutes.
     """
+    warnings: list[str] = []
     try:
         top = decode_typed(body)
     except ValueError:
-        return body, 0
+        return body, 0, ["catalog body did not decode"]
     injected = 0
     extras = bytearray()
     for i, (raw, wtype) in enumerate(top.get(1, [])):
         if wtype != 2 or not isinstance(raw, bytes):
             continue
-        entry = decode_typed(raw)
+        try:
+            entry = decode_typed(raw)
+        except ValueError:
+            warnings.append("catalog entry failed to decode")
+            continue
         id_vals = entry.get(F_ENTRY_ID)
         if not id_vals:
             continue
         model_id = id_vals[0][0]
-        if not isinstance(model_id, bytes) or not CLONEABLE_RE.match(model_id):
+        if not isinstance(model_id, bytes):
+            continue
+        if not CLONEABLE_RE.match(model_id):
+            if ASTRA_LIKE_RE.search(model_id):
+                warnings.append(
+                    f"astra-like id not relabeled: {model_id.decode(errors='replace')}")
             continue
         # relabel the base entry in place: it IS the codex route
         _relabel(entry, "Codex sub")
@@ -107,9 +147,11 @@ def inject_route_entries(body: bytes) -> tuple[bytes, int]:
         if clone:
             extras += field(1, clone)
             injected += 1
+        else:
+            warnings.append(f"clone failed for {model_id.decode(errors='replace')}")
     if injected:
         body = encode_typed(top) + bytes(extras)
-    return body, injected
+    return body, injected, warnings
 
 
 def _relabel(entry, label: str) -> None:
@@ -124,31 +166,32 @@ def _relabel(entry, label: str) -> None:
         entry[F_ENTRY_BADGES] = [(encode_typed(group), 2)]
 
 
-def rewrite_assign(body: bytes) -> tuple[bytes, str | None]:
-    """Strip a route suffix from an AssignModel selector; pin the session.
+def rewrite_assign(body: bytes) -> tuple[bytes, str, str]:
+    """Strip a route suffix from an AssignModel selector.
 
-    Returns ``(new_body, requested_route_or_None)``. The session uuid in
-    field 3 is recorded so later GetChatMessage packets can honor a
-    ``-native`` pick while leaving the Codex route as the default.
+    Returns ``(new_body, session_uuid, requested_route)``. The pin is NOT
+    committed here — the caller commits via :func:`pin_route` only after the
+    upstream assignment succeeds, so a failed selection cannot repin.
     """
     try:
         msg = decode_typed(body)
     except ValueError:
-        return body, None
+        return body, "", ""
     selector = get_string(msg, F_ASSIGN_SELECTOR)
-    route = None
-    if selector.endswith(CODEX_SUFFIX):
-        route = "codex"
-    elif selector.endswith(NATIVE_SUFFIX):
-        route = "native"
-    if route is None:
-        return body, None
-    set_string(msg, F_ASSIGN_SELECTOR, selector[: -len(route) - 1])
+    if not selector.endswith(NATIVE_SUFFIX):
+        return body, "", ""
+    set_string(msg, F_ASSIGN_SELECTOR, selector[: -len(NATIVE_SUFFIX)])
     session = get_string(msg, F_ASSIGN_SESSION)
-    if session:
-        with _lock:
-            _session_routes[session] = route
-    return encode_typed(msg), route
+    return encode_typed(msg), session, "native"
+
+
+def pin_route(session: str, route: str) -> None:
+    """Commit a session route after its assignment succeeded upstream."""
+    if not session:
+        return
+    with _lock:
+        _session_routes[session] = route
+        _save_locked()
 
 
 def session_route(packet) -> str | None:
