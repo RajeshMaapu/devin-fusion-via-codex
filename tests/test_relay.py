@@ -339,6 +339,59 @@ class CallCodexTest(unittest.TestCase):
                              ["encrypted_content"], "E")
 
 
+class LogPrivacyTest(unittest.TestCase):
+    """Regression: no user/assistant content or tool args may reach rec dicts."""
+
+    MARKER = "SECRET_MARKER_7X9Q"
+
+    def test_request_path_record_carries_no_content(self) -> None:
+        tc = wire.field(6, wire.field(1, "c1") + wire.field(2, "tool_a")
+                        + wire.field(3, '{"k":"%s"}' % self.MARKER))
+        user = wire.field(2, 1) + wire.field(3, self.MARKER + " prompt")
+        asst = wire.field(2, 2) + wire.field(3, "asst " + self.MARKER) + tc
+        tout = wire.field(2, 4) + wire.field(3, "out " + self.MARKER) \
+            + wire.field(7, "c1")
+        body = (wire.field(3, user) + wire.field(3, asst) + wire.field(3, tout)
+                + wire.field(16, "seed") + wire.field(21, "gpt-6-astra-high"))
+        rec: dict = {}
+        packet_to_responses_body(wire.decode(body), parse_routed_model("x"), rec)
+        self.assertNotIn(self.MARKER, json.dumps(rec))
+
+    def test_response_path_record_carries_no_content(self) -> None:
+        complete = {
+            "id": "r", "status": "completed",
+            "output": [{"type": "function_call", "call_id": "c",
+                        "name": "t", "arguments": '{"k":"%s"}' % self.MARKER}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        rec: dict = {}
+        translate._final_message(complete, [], rec)
+        translate._record_usage(complete, rec)
+        self.assertNotIn(self.MARKER, json.dumps(rec))
+
+    def test_delta_records_chars_not_text(self) -> None:
+        rec: dict = {}
+        events = [{"type": "response.output_text.delta",
+                   "delta": self.MARKER},
+                  {"type": "response.completed", "response": {
+                      "id": "r", "status": "completed", "output": [],
+                      "usage": {}}}]
+        import urllib.request
+        fake = _FakeSSE(events)
+        orig = urllib.request.urlopen
+        orig_auth = translate.auth.get_token
+        urllib.request.urlopen = lambda *a, **k: fake  # type: ignore
+        translate.auth.get_token = lambda: ("t", "a")  # type: ignore
+        try:
+            translate.call_codex({"prompt_cache_key": "k"}, rec,
+                                 on_delta=lambda f: True)
+        finally:
+            urllib.request.urlopen = orig  # type: ignore
+            translate.auth.get_token = orig_auth  # type: ignore
+        self.assertNotIn(self.MARKER, json.dumps(rec))
+        self.assertEqual(rec["delta_chars"], len(self.MARKER))
+
+
 class FinalMessageTest(unittest.TestCase):
     """Codex response -> wire message translation."""
 
