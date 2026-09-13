@@ -31,21 +31,25 @@ model as usual (`--model`, `/model`, or `DEVIN_MODEL`).
 
 ### `/model` picker entries
 
-Under the relay the model picker gains two labeled clones of every
-`gpt-6-astra*` / `fusion-gpt-6-astra*` entry (≈140 injected):
+Under the relay, every `gpt-6-astra*` / `fusion-gpt-6-astra*` catalog entry
+is **relabeled in place** with a `· Codex sub` suffix + Route badge — the
+models you already pick ARE the subscription route. A `…-native` clone per
+entry (labeled `· Native`) provides the per-session escape hatch back to
+Cognition-billed Astra.
 
-- `… · Codex sub` — id suffix `-codex`. Explicit subscription route
-  (identical to the default under the relay; the label makes it visible).
-- `… · Native` — id suffix `-native`. Per-session escape hatch back to
-  Cognition-billed Astra without restarting `devin`.
-
-Mechanics: the picker sends the suffixed id in `AssignModel` field 2 → the
+Mechanics: picking a `-native` id sends it in `AssignModel` field 2 → the
 relay strips the suffix (Cognition only knows canonical ids), pins the
 session uuid → `GetChatMessage` field 16 carries the same uuid and honors the
-pin. Verified live: `-native` pins forward to Cognition, `-codex`/unpinned go
-to Codex. Caveat: `--model <injected-id>` on the command line can't resolve
-injected ids (fuzzy match runs before the catalog loads) — use `/model` in
-the UI or the canonical names.
+pin. Caveat: `--model`/`DEVIN_MODEL` can't resolve `-native` ids (fuzzy match
+runs without catalog) — the picker is the way to reach it.
+
+### Default model
+
+`~/.config/devin/config.json` `agent.model` is set to
+`fusion-gpt-6-astra-high-sidekick-swe-2-medium` (verified: fresh session
+picks it up and routes the lead to Codex). In a plain `devin` session the
+same default hits the native Cognition path — and its quota — so run
+everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 
 ```bash
 ~/projects/fusion-codex-relay/bin/fusion-relay stats    # route counters

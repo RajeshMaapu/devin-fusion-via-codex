@@ -195,22 +195,27 @@ class CatalogTest(unittest.TestCase):
              + wire.field(23, inner) + wire.field(30, badges))
         return wire.field(1, e)  # top-level repeated field 1
 
-    def test_inject_adds_codex_and_native_clones(self) -> None:
+    def test_inject_relabels_base_and_adds_native_clones(self) -> None:
         body = self._entry("gpt-6-astra-high", "GPT-6 Astra High Thinking")
         body += self._entry("fusion-gpt-6-astra-high-sidekick-swe-2-medium", "Fusion A/S")
         body += self._entry("claude-opus-5-medium", "Opus")  # not cloneable
         out, n = catalog.inject_route_entries(body)
-        self.assertEqual(n, 4)  # 2 cloneable entries x 2 routes
+        self.assertEqual(n, 2)  # one -native clone per astra entry
         top = wire.decode_typed(out)
-        ids = [wire.get_string(wire.decode_typed(v), 22)
-               for v, w in top[1] if w == 2]
-        self.assertIn("gpt-6-astra-high-codex", ids)
-        self.assertIn("gpt-6-astra-high-native", ids)
-        self.assertIn("fusion-gpt-6-astra-high-sidekick-swe-2-medium-codex", ids)
-        self.assertNotIn("claude-opus-5-medium-codex", ids)
-        names = [wire.get_string(wire.decode_typed(v), 1)
+        pairs = [(wire.get_string(wire.decode_typed(v), 22),
+                  wire.get_string(wire.decode_typed(v), 1))
                  for v, w in top[1] if w == 2]
+        ids = [p[0] for p in pairs]
+        names = [p[1] for p in pairs]
+        # base ids keep canonical ids, names carry the Codex sub label
+        self.assertIn("gpt-6-astra-high", ids)
         self.assertIn("GPT-6 Astra High Thinking · Codex sub", names)
+        self.assertIn("Fusion A/S · Codex sub", names)
+        # only -native clones injected
+        self.assertIn("gpt-6-astra-high-native", ids)
+        self.assertIn("fusion-gpt-6-astra-high-sidekick-swe-2-medium-native", ids)
+        self.assertNotIn("gpt-6-astra-high-codex", ids)
+        self.assertNotIn("claude-opus-5-medium-native", ids)
 
     def test_inject_on_garbage_returns_input(self) -> None:
         self.assertEqual(catalog.inject_route_entries(b"\xff\xff"), (b"\xff\xff", 0))

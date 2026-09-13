@@ -75,10 +75,14 @@ def _clone_entry(raw: bytes, suffix: str, badge_text: str) -> bytes | None:
 
 
 def inject_route_entries(body: bytes) -> tuple[bytes, int]:
-    """Append -codex/-native clones to a raw GetCliModelConfigs response.
+    """Relabel astra entries as Codex-routed; append ``-native`` clones.
 
-    Returns ``(new_body, injected_count)``. Protobuf repeated fields merge on
-    concatenation, so new entries are simply appended to the body.
+    Under the relay every ``gpt-6-astra*`` / ``fusion-gpt-6-astra*`` selection
+    is served by the Codex subscription, so the base display name gets a
+    truthful "· Codex sub" suffix and a Route badge. A ``-native`` clone per
+    entry provides the in-UI escape hatch back to Cognition-billed Astra.
+
+    Returns ``(new_body, injected_count)``.
     """
     try:
         top = decode_typed(body)
@@ -86,22 +90,38 @@ def inject_route_entries(body: bytes) -> tuple[bytes, int]:
         return body, 0
     injected = 0
     extras = bytearray()
-    for raw, wtype in top.get(1, []):
+    for i, (raw, wtype) in enumerate(top.get(1, [])):
         if wtype != 2 or not isinstance(raw, bytes):
             continue
-        id_vals = decode_typed(raw).get(F_ENTRY_ID)
+        entry = decode_typed(raw)
+        id_vals = entry.get(F_ENTRY_ID)
         if not id_vals:
             continue
         model_id = id_vals[0][0]
         if not isinstance(model_id, bytes) or not CLONEABLE_RE.match(model_id):
             continue
-        for suffix, label in ((CODEX_SUFFIX, "Codex sub"),
-                              (NATIVE_SUFFIX, "Native")):
-            clone = _clone_entry(raw, suffix, label)
-            if clone:
-                extras += field(1, clone)
-                injected += 1
-    return body + bytes(extras), injected
+        # relabel the base entry in place: it IS the codex route
+        _relabel(entry, "Codex sub")
+        top[1][i] = (encode_typed(entry), 2)
+        clone = _clone_entry(raw, NATIVE_SUFFIX, "Native")
+        if clone:
+            extras += field(1, clone)
+            injected += 1
+    if injected:
+        body = encode_typed(top) + bytes(extras)
+    return body, injected
+
+
+def _relabel(entry, label: str) -> None:
+    """Append ``· <label>`` to an entry's display name and badge list."""
+    name = get_string(entry, F_ENTRY_NAME)
+    if name and label not in name:
+        set_string(entry, F_ENTRY_NAME, name + " · " + label)
+    badges = entry.get(F_ENTRY_BADGES)
+    if badges:
+        group = decode_typed(badges[0][0])  # type: ignore[arg-type]
+        group.setdefault(F_BADGE_LIST, []).append((_badge("Route", label), 2))
+        entry[F_ENTRY_BADGES] = [(encode_typed(group), 2)]
 
 
 def rewrite_assign(body: bytes) -> tuple[bytes, str | None]:
