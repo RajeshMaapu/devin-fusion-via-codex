@@ -76,11 +76,41 @@ identical behavior *when launched through the wrapper*.
 
 ## 5. Codex computer use
 
-**Unsupported-for-us / Not yet tested.** The relay mediates inference, not
-tool runtimes. Codex computer-use-as-a-service for external clients is a
-vendor capability question; no screenshot→action→verify cycle has been
-attempted. Devin's own tools (exec/write/read) work through the relay —
-proven — but that's Devin's runtime, not Codex's.
+**Implemented + Tested** (relay-side `CodexComputerProvider` equivalent).
+The supported surface is `cua_repl` — the MCP server the ChatGPT desktop
+app itself uses — driven as a persistent JSON-RPC child of the relay
+(`fusion_relay/cua.py`). The raw `SkyComputerUseClient mcp` binary
+handshakes but hangs on `tools/call` for unsigned parents; `cua_repl` is
+the working path.
+
+Architecture: on Codex-routed turns the relay injects a `codex_computer`
+function tool into the Responses request, intercepts the model's calls to
+it (they never reach the Devin client), executes them against `cua_repl`,
+and feeds `function_call_output` items back inside the same turn —
+an internal tool loop bounded at 16 iterations. Mixed turns (our call +
+a native Devin call in one response) emit only native calls downstream;
+our call+output pairs are stashed and re-injected into the next request's
+input before the following tool outputs. Screenshots land as PNGs under
+`$DATA_DIR/cua-shots/`; the AX-tree diff is the primary observation
+channel. Consent elicitations are answered `accept` + `persist: always`;
+grants are recorded by app bundle id in the request record and persist in
+`ComputerUseAppApprovals.json` (auditable, revocable). One provider, one
+lock — concurrent sessions cannot interleave desktop actions.
+
+| Criterion | Status | Evidence |
+|---|---|---|
+| Real screenshot → action → verification cycle | Implemented+Tested | `getApp(finder)` → `getAXState` (AX diff text) + `getScreenshot` (PNG image block, ~87 KB); Calculator `pressKey 4`,`2` → display `…×10042`, `Escape` → `0` — verified via AX diff |
+| Lead + sidekick follow selected policy | Implemented | Tool injected only on Codex-routed requests; sidekick (SWE-2 → Cognition) sees no computer tools. Devin's wire carries no native computer tools, so nothing is removed |
+| Missing permissions → explicit errors | Implemented+Tested | Declined elicitation → `isError` "not approved to use Preview"; unknown app → "Invalid app"; timeout → "timed out; kernel reset". Provider failure → `computer_unavailable`; stale call with provider off → `computer_policy_denied` |
+| No silent fallback to Devin computer use | Implemented | The tool exists only inside the Codex route; no other surface is attempted |
+| Mutual exclusion | Implemented | Single serialized provider process; verified two concurrent external `cua_repl` clients DO both run — the service does not exclude them, so the lock is load-bearing |
+| Full Fusion loop | Implemented+Tested | Session 2026-09-13T23:19Z: astra→Codex turn ran `codex_computer` (listApps → 26), delegated to SWE-2 (3 native Cognition turns), resumed, ran `codex_computer` again (Calculator present → true), answered `CYCLE2_DONE N=26 CALC=true` (delta_chars 26) |
+
+Residual gaps (honest): the elicitation auto-accept is a relay policy —
+a real product would surface it in-session; per-turn (not persisted)
+session scoping means every relay restart re-prompts for unapproved apps;
+and this remains a private-surface integration, not a vendor-supported
+tool contract.
 
 ## 6. Operational and privacy weaknesses — all addressed
 
@@ -123,6 +153,18 @@ verified earlier (`codex_http_status` + error frame path). A synthetic
 500-injection test is not wired — the failure path is shared with observed
 real failures.
 
+**With computer use in the loop** (2026-09-13T23:19Z, relay `relay_tool_calls`
+records):
+
+```
+astra n=7   codex 200  [codex_computer + sidekick]   relay exec'd CUA internally; sidekick spawned
+swe-2  ×3   cognition                                native sidekick turns
+astra n=13  codex 200  [codex_computer]              relay exec'd 2nd CUA call; final answer
+```
+
+Final text `CYCLE2_DONE N=26 CALC=true` — lead observed the desktop, the
+native sidekick ran, the lead re-observed via computer use, then answered.
+
 ## Summary table
 
 | # | Item | Verdict |
@@ -132,7 +174,7 @@ real failures.
 | 2 | Transactional+persistent selection | Implemented+Tested |
 | 3 | Consistent default | Implemented+Tested (through wrapper) |
 | 4 | Semantic fidelity | Implemented+Tested; live image turn not yet tested |
-| 5 | Codex computer use | Unsupported / not tested |
+| 5 | Codex computer use | Implemented+Tested via `cua_repl` provider; per-app consent is relay-auto-accepted (policy gap vs in-session UI) |
 | 6 | Ops+privacy fixes | Implemented+Tested |
 | 7 | Full-cycle evidence | Tested successfully — recorded |
 

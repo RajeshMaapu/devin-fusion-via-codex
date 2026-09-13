@@ -423,6 +423,152 @@ class FinalMessageTest(unittest.TestCase):
         self.assertNotIn("secret", json.dumps(rec))
 
 
+class RelayToolLoopTest(unittest.TestCase):
+    """codex_computer interception: internal loop, stash, policy denial."""
+
+    def setUp(self) -> None:
+        translate.reset()
+        self._orig = translate.call_codex
+
+    def tearDown(self) -> None:
+        translate.call_codex = self._orig  # type: ignore
+
+    def _queue(self, outputs: list[list[dict]]) -> list[dict]:
+        """Patch call_codex; each entry is one response's output items."""
+        calls: list[dict] = []
+
+        def fake(body, rec, on_delta=None, timeout=0, _items_out=None):
+            calls.append(json.loads(json.dumps(body)))
+            items = outputs[len(calls) - 1]
+            if _items_out is not None:
+                _items_out.extend(items)
+            msg = wire.field(1, "r")
+            for it in items:
+                if it.get("type") == "function_call":
+                    msg += wire.field(6, wire.field(1, it["call_id"])
+                                      + wire.field(2, it["name"])
+                                      + wire.field(3, it.get("arguments", "")))
+            has_calls = any(it.get("type") == "function_call"
+                            for it in items)
+            msg += wire.field(5, 10 if has_calls else 1)
+            return wire.frame(msg) + wire.end_stream()
+        translate.call_codex = fake  # type: ignore
+        return calls
+
+    @staticmethod
+    def _cua_call(cid: str = "c1") -> dict:
+        return {"type": "function_call", "call_id": cid,
+                "name": translate.CUA_TOOL_NAME,
+                "arguments": '{"code":"console.log(1)"}'}
+
+    @staticmethod
+    def _native_call(cid: str = "n1") -> dict:
+        return {"type": "function_call", "call_id": cid,
+                "name": "shell", "arguments": "{}"}
+
+    def test_inject_tool_once(self) -> None:
+        body: dict = {"tools": [{"name": "shell"}]}
+        translate.inject_computer_tool(body)
+        translate.inject_computer_tool(body)
+        names = [t["name"] for t in body["tools"]]
+        self.assertEqual(names, ["shell", translate.CUA_TOOL_NAME])
+
+    def test_internal_loop_executes_and_continues(self) -> None:
+        ran: list[str] = []
+        calls = self._queue([[self._cua_call()], []])
+        out = translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, {},
+            executor=lambda c, r: ran.append(c["call_id"]) or "RESULT_OK")
+        self.assertEqual(ran, ["c1"])
+        self.assertEqual(len(calls), 2)
+        # second request input carries verbatim call + our output
+        second_input = calls[1]["input"]
+        kinds = [(i.get("type"), i.get("call_id"), i.get("output"))
+                 for i in second_input]
+        self.assertIn(("function_call", "c1", None), kinds)
+        self.assertIn(("function_call_output", "c1", "RESULT_OK"), kinds)
+        self.assertTrue(out)
+
+    def test_mixed_calls_strip_ours_and_stash(self) -> None:
+        calls = self._queue([[self._cua_call(), self._native_call()]])
+        out = translate.call_codex_with_tools(
+            {"prompt_cache_key": "kk", "input": []}, {},
+            executor=lambda c, r: "DONE")
+        # emitted wire carries only the native call
+        frames = [p for f, p in wire.iter_frames(out) if not f & 0x02]
+        names = [wire.text(wire.decode(v), 2)
+                 for v in wire.decode(frames[-1]).get(6, [])]
+        self.assertEqual(names, ["shell"])
+        # stash holds our call + output for next request
+        with translate._relay_items_lock:
+            stashed = translate._relay_items_cache["kk"]
+        self.assertEqual(
+            [(i["type"], i.get("call_id")) for i in stashed],
+            [("function_call", "c1"), ("function_call_output", "c1")])
+
+    def test_stashed_items_reinjected_next_request(self) -> None:
+        translate.stash_relay_items(
+            translate._cache_key("seed-9"),
+            [{"type": "function_call", "call_id": "cx",
+              "name": translate.CUA_TOOL_NAME, "arguments": "{}"},
+             {"type": "function_call_output", "call_id": "cx",
+              "output": "OUT"}])
+        asst = (wire.field(2, 2) + wire.field(3, "working")
+                + wire.field(6, wire.field(1, "n1") + wire.field(2, "shell")
+                             + wire.field(3, "{}")))
+        tout = (wire.field(2, 4) + wire.field(3, "shell out")
+                + wire.field(7, "n1"))
+        body = (wire.field(3, asst) + wire.field(3, tout)
+                + wire.field(16, "seed-9") + wire.field(21, "gpt-6-astra-high"))
+        rec: dict = {}
+        req = packet_to_responses_body(wire.decode(body),
+                                       parse_routed_model("x"), rec)
+        self.assertEqual(rec["relay_items_reinjected"], 2)
+        kinds = [(i.get("type"), i.get("call_id")) for i in req["input"]]
+        pos = kinds.index(("function_call", "cx"))
+        self.assertEqual(kinds[pos + 1], ("function_call_output", "cx"))
+        # our pair lands before the native call's output
+        self.assertLess(pos + 1,
+                        kinds.index(("function_call_output", "n1")))
+
+    def test_no_executor_denies_policy(self) -> None:
+        calls = self._queue([[self._cua_call()], []])
+        translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, {}, executor=None)
+        outputs = [i.get("output") for i in calls[1]["input"]
+                   if i.get("type") == "function_call_output"]
+        self.assertTrue(any("computer_policy_denied" in str(o)
+                            for o in outputs))
+
+    def test_loop_bound_stops_runaway(self) -> None:
+        self._queue([[self._cua_call(f"c{i}")] for i in range(25)])
+        rec: dict = {}
+        translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, rec,
+            executor=lambda c, r: "ok")
+        self.assertTrue(rec.get("relay_tool_loop_bound"))
+
+    def test_drop_tool_calls_preserves_usage_and_id(self) -> None:
+        tail = (wire.frame(
+            wire.field(1, "resp-9")
+            + wire.field(6, wire.field(1, "a") + wire.field(2, "shell")
+                         + wire.field(3, "{}"))
+            + wire.field(6, wire.field(1, "b") + wire.field(2, "codex_computer")
+                         + wire.field(3, "{}"))
+            + wire.field(7, wire.field(2, 11) + wire.field(3, 7))
+            + wire.field(5, translate.FINISH_TOOL_CALLS))
+            + wire.end_stream())
+        out = translate._drop_tool_calls(tail, {"codex_computer"}, {})
+        frames = wire.iter_frames(out)
+        msg = wire.decode(frames[0][1])
+        self.assertEqual(wire.text(msg, 1), "resp-9")
+        names = [wire.text(wire.decode(v), 2) for v in msg.get(6, [])]
+        self.assertEqual(names, ["shell"])
+        usage = wire.decode(msg[7][0])  # type: ignore[arg-type]
+        self.assertEqual((usage[2][0], usage[3][0]), (11, 7))
+        self.assertTrue(frames[-1][0] & 0x02)  # trailer intact
+
+
 class CatalogTest(unittest.TestCase):
     """Catalog injection + AssignModel rewrite + session pinning."""
 

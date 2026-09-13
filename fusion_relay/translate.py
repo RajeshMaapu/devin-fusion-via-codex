@@ -43,7 +43,7 @@ from dataclasses import dataclass, field as dc_field
 from typing import Callable, Iterator, Optional
 
 from . import auth
-from .wire import Message, decode, end_stream, field, frame, text
+from .wire import Message, decode, end_stream, field, frame, iter_frames, text
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 
@@ -67,6 +67,48 @@ IGNORABLE_TEXT_BYTES = 128
 FINISH_STOP, FINISH_TOOL_CALLS = 1, 10
 
 _REASONING_CACHE_SIZE = 64
+
+# Relay-owned tool surface (CodexComputerProvider). Injected only on
+# Codex-routed turns; its calls are executed inside the relay and never
+# reach the Devin client.
+CUA_TOOL_NAME = "codex_computer"
+CUA_TOOL = {
+    "type": "function",
+    "name": CUA_TOOL_NAME,
+    "description": (
+        "Control macOS apps and browsers through Codex Computer Use. Runs "
+        "JavaScript in a persistent REPL exposing the `cua` API: "
+        "await cua.listApps(); const app = await cua.getApp(bundleIdOrName); "
+        "then app.getAXState() (accessibility-tree diff with element ids — "
+        "prefer it), app.getScreenshot() (saved to a file; the path is "
+        "returned), app.click(idOrXY), app.pressKey('Return'|'a'|'super+c'|"
+        "'Tab'), app.typeText(text), app.scroll(idOrXY,'down',pages). "
+        "Use console.log(...) to return values — expression results are "
+        "not echoed. Batch actions, then getAXState() to observe results."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string",
+                     "description": "JavaScript using the cua API; "
+                                    "console.log() returns values"},
+            "title": {"type": "string",
+                      "description": "Short description of this step"},
+            "timeout_ms": {"type": "integer",
+                           "description": "Execution timeout (default 45000)"},
+        },
+        "required": ["code"],
+    },
+    "strict": False,
+}
+
+_relay_items_lock = threading.Lock()
+# cache_key -> verbatim replay items (our calls + their outputs) that must
+# be re-injected into the next request's input because the client never saw
+# the relay-owned tool round trip.
+_relay_items_cache: dict[str, list[dict]] = {}
+_RELAY_ITEMS_CACHE_SIZE = 64
+MAX_TOOL_LOOPS = 16
 
 
 class UnsupportedRequest(ValueError):
@@ -244,6 +286,21 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
         inputs[last_assistant_start:last_assistant_start] = prior
         rec["reasoning_echoed"] = len(prior)
 
+    # Re-inject relay-owned tool items the client never saw (calls the
+    # relay answered itself last turn). They belong after the assistant
+    # turn that emitted them — before the tool outputs that follow.
+    with _relay_items_lock:
+        pending = _relay_items_cache.pop(cache_key, [])
+    if pending:
+        insert_at = len(inputs)
+        if last_assistant_start is not None:
+            for idx in range(last_assistant_start, len(inputs)):
+                if inputs[idx].get("type") == "function_call_output":
+                    insert_at = idx
+                    break
+        inputs[insert_at:insert_at] = pending
+        rec["relay_items_reinjected"] = len(pending)
+
     prefix = text(packet, 2)
     if prefix:
         instructions.insert(0, prefix)
@@ -267,6 +324,21 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
     }
 
 
+def inject_computer_tool(body: dict) -> None:
+    """Offer the codex_computer tool on a Codex-bound request body."""
+    tools = body.setdefault("tools", [])
+    if not any(t.get("name") == CUA_TOOL_NAME for t in tools):
+        tools.append(dict(CUA_TOOL))
+
+
+def stash_relay_items(cache_key: str, items: list[dict]) -> None:
+    """Remember executed relay-tool items for re-injection next request."""
+    with _relay_items_lock:
+        _relay_items_cache[cache_key] = items
+        while len(_relay_items_cache) > _RELAY_ITEMS_CACHE_SIZE:
+            _relay_items_cache.pop(next(iter(_relay_items_cache)))
+
+
 def _record_usage(complete: dict, rec: dict) -> None:
     usage = complete.get("usage")
     if usage:
@@ -277,14 +349,21 @@ def _record_usage(complete: dict, rec: dict) -> None:
     rec["codex_status"] = complete.get("status")
 
 
-def _final_message(complete: dict, items: list[dict], rec: dict) -> bytes:
-    """Build the final wire message (usage + finish + any tool calls)."""
+def _final_message(complete: dict, items: list[dict], rec: dict,
+                   drop_names: frozenset = frozenset()) -> bytes:
+    """Build the final wire message (usage + finish + any tool calls).
+
+    ``drop_names`` suppresses relay-owned tool calls the client never
+    dispatched (mixed-call turns where native calls still go to Devin).
+    """
     if not complete.get("output"):
         complete["output"] = items
     result = field(1, complete["id"])
     has_tool = False
     for item in complete.get("output", []):
         if item["type"] == "function_call":
+            if item.get("name") in drop_names:
+                continue
             # Tool names are logged; arguments never are (privacy) — they go
             # to the wire only.
             rec.setdefault("tool_call_names", []).append(item["name"])
@@ -301,7 +380,8 @@ def _final_message(complete: dict, items: list[dict], rec: dict) -> bytes:
 
 def call_codex(body: dict, rec: dict,
                on_delta: Optional[Callable[[bytes], bool]] = None,
-               timeout: int = 300) -> bytes:
+               timeout: int = 300,
+               _items_out: Optional[list] = None) -> bytes:
     """Call the Codex Responses endpoint; return the complete wire stream.
 
     If *on_delta* is given it is invoked once per assistant text delta with a
@@ -313,6 +393,9 @@ def call_codex(body: dict, rec: dict,
 
     The returned bytes always contain the terminal message (usage, tool
     calls, finish reason) followed by the end-of-stream trailer.
+
+    ``_items_out`` (internal) receives the completed response's output items
+    so the tool-loop wrapper can inspect calls without re-decoding wire bytes.
     """
     token, account_id = auth.get_token()
     headers = {
@@ -373,8 +456,10 @@ def call_codex(body: dict, rec: dict,
     if complete is None:
         raise RuntimeError("codex stream ended without response.completed")
     _record_usage(complete, rec)
-    _stash_reasoning(body.get("prompt_cache_key", ""),
-                     complete.get("output", []) or items)
+    output_items = complete.get("output", []) or items
+    _stash_reasoning(body.get("prompt_cache_key", ""), output_items)
+    if _items_out is not None:
+        _items_out.extend(output_items)
     out = b""
     if on_delta is None and text_parts:
         out += frame(field(3, "".join(text_parts)))
@@ -382,7 +467,99 @@ def call_codex(body: dict, rec: dict,
     return out
 
 
+def call_codex_with_tools(body: dict, rec: dict,
+                          on_delta: Optional[Callable[[bytes], bool]] = None,
+                          executor: Optional[Callable[[dict, dict], str]] = None,
+                          max_loops: int = MAX_TOOL_LOOPS) -> bytes:
+    """Like call_codex, but executes relay-owned tool calls internally.
+
+    ``executor(call_item, rec) -> result_text`` runs a relay-owned call.
+    Turns loop while every function_call is relay-owned. If a response mixes
+    relay-owned and native calls, the relay-owned ones are executed, their
+    call+output items are stashed for re-injection on the next request, and
+    only native calls are emitted downstream. A stale relay-owned call with
+    no executor gets ``computer_policy_denied`` — never executed.
+    """
+    cache_key = body.get("prompt_cache_key", "")
+    for _ in range(max_loops):
+        items: list[dict] = []
+        tail = call_codex(body, rec, on_delta=on_delta, _items_out=items)
+        calls = [it for it in items if it.get("type") == "function_call"]
+        ours = [c for c in calls if c.get("name") == CUA_TOOL_NAME]
+        if not ours:
+            return tail
+        native = [c for c in calls if c.get("name") != CUA_TOOL_NAME]
+        rec["relay_tool_calls"] = rec.get("relay_tool_calls", 0) + len(ours)
+        # Replay context: raw output items plus an output right after each
+        # of our calls. For loop-continuation the whole turn replays; for a
+        # mixed finish only OUR pairs are stashed (the client's own history
+        # already carries the native call it is about to answer).
+        replay: list[dict] = []
+        our_pairs: list[dict] = []
+        ours_by_id = {c.get("call_id"): c for c in ours}
+        for it in items:
+            replay.append(it)
+            if it.get("type") == "function_call" and it.get("call_id") in ours_by_id:
+                output_item = {"type": "function_call_output",
+                               "call_id": it["call_id"],
+                               "output": _exec_relay_call(it, executor, rec)}
+                replay.append(output_item)
+                our_pairs.extend((it, output_item))
+        if not native:
+            body.setdefault("input", []).extend(replay)
+            continue  # all calls were ours — keep the turn going
+        # Mixed: emit only native calls; ours are re-injected next request.
+        stash_relay_items(cache_key, our_pairs)
+        return _drop_tool_calls(tail, {CUA_TOOL_NAME}, rec)
+    rec["relay_tool_loop_bound"] = True
+    return tail
+
+
+def _drop_tool_calls(tail: bytes, names: set, rec: dict) -> bytes:
+    """Rebuild the terminal frame minus tool calls named in ``names``.
+
+    Keeps id/usage/finish fields intact and preserves any earlier frames
+    (e.g. buffered text) and the trailer.
+    """
+    frames = iter_frames(tail)
+    body_frames = [(f, p) for f, p in frames if not f & 0x02]
+    if not body_frames:
+        return tail
+    last_flags, last_payload = body_frames[-1]
+    try:
+        msg = decode(last_payload)
+    except ValueError:
+        return tail
+    kept: list[tuple[int, object]] = []
+    for num, values in msg.items():
+        for v in values:
+            if num == 6 and isinstance(v, bytes):
+                try:
+                    if text(decode(v), 2) in names:
+                        continue
+                except ValueError:
+                    pass
+            kept.append((num, v))
+    rebuilt = b"".join(field(num, v) for num, v in kept)
+    head = b"".join(bytes([f]) + len(p).to_bytes(4, "big") + p
+                    for f, p in body_frames[:-1])
+    return head + bytes([last_flags]) + len(rebuilt).to_bytes(4, "big") + rebuilt \
+        + end_stream()
+
+
+def _exec_relay_call(call: dict, executor: Optional[Callable], rec: dict) -> str:
+    if executor is None:
+        return ("computer_policy_denied: codex_computer is not available "
+                "in this execution profile")
+    try:
+        return executor(call, rec)
+    except Exception as e:  # executor surfaces explicit error text
+        return f"computer_unavailable: {e}"
+
+
 def reset() -> None:
-    """Clear the reasoning cache (tests)."""
+    """Clear the reasoning + relay-item caches (tests)."""
     with _reasoning_lock:
         _reasoning_cache.clear()
+    with _relay_items_lock:
+        _relay_items_cache.clear()

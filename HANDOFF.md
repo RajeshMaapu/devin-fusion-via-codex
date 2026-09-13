@@ -82,13 +82,34 @@ Manage: `launchctl kickstart -k gui/$(id -u)/ai.maapu.fusion-relay` (restart),
 | `fusion_relay/translate.py` | `GetChatMessage` packet → Responses-API body; SSE stream → wire messages. Model-id suffix → `reasoning.effort` (`-max`→`xhigh`, `-fast` stripped with note) |
 | `fusion_relay/auth.py` | Reads `~/.codex/auth.json` (ChatGPT mode only); refreshes via `auth.openai.com/oauth/token` under flock + atomic rename; never logs tokens |
 | `fusion_relay/relay.py` | `ThreadingHTTPServer` on 127.0.0.1; routing table, verbatim forwarder, delta/buffer streaming, JSONL accounting, `/healthz` `/stats` |
+| `fusion_relay/cua.py` | CodexComputerProvider: persistent `cua_repl` MCP child, per-app consent auto-grants, serialized calls, `computer_unavailable`/`computer_policy_denied` errors |
 | `bin/fusion-relay` | start/stop/status/stats/fg process manager |
 | `bin/devin-fusion` | devin launcher with the override |
 | `fusion_relay/catalog.py` | `GetCliModelConfigs` rewrite: relabel astra/fusion-astra entries `· Codex sub`, append `-native` clones; `AssignModel` suffix strip + `session_uuid → route` pinning |
-| `tests/test_relay.py` | 24 unit tests: codec, routing table, translation, catalog injection/relabel, assign rewrite, session pinning, finish reasons |
+| `tests/test_relay.py` | 47 unit tests: codec, routing, translation, catalog, pins, tool loop, privacy regression |
 
 Runtime state (never committed): `~/.local/share/fusion-codex-relay/` —
-`requests.jsonl` (per-request sanitized records), `relay.log`, `relay.pid`.
+`requests.jsonl` (per-request sanitized records), `relay.log`, `relay.pid`,
+`stats.json`, `routes.json`, `relay-token` (0600), `cua-shots/` (PNGs the
+computer tool captures).
+
+## Codex computer use (`codex_computer` tool)
+
+Codex-routed turns get one extra function tool, `codex_computer`, injected
+into the Responses request. Calls to it are executed inside the relay —
+never emitted to the client — by a persistent `cua_repl` MCP child (the
+same surface ChatGPT's own desktop app uses; raw `SkyComputerUseClient
+mcp` hangs for unsigned parents). JS API: `cua.listApps()`, `cua.getApp(id)`
+→ `getAXState()` / `getScreenshot()` / `click` / `pressKey` / `typeText` /
+`scroll`; `console.log` returns values. Per-app consent elicitations are
+answered `accept` + `persist: always` — grants land in
+`Library/Group Containers/2DC432GLL2.com.openai.sky.CUAService/.../
+ComputerUseAppApprovals.json` and are logged by bundle id in the request
+record. One provider + one lock = concurrent sessions cannot interleave
+desktop actions. Mixed turns (our call + a native call) emit only native
+calls downstream; our call+output pairs are stashed and re-injected on
+the next request. Disable with `FUSION_RELAY_CUA=0`. Verified live:
+lead→computer→sidekick→lead→computer→answer (`CYCLE2_DONE N=26`).
 
 ## Wire protocol facts (reverse-engineered, verified live)
 
@@ -133,14 +154,23 @@ reasoning.effort, stream, store:false, prompt_cache_key}`.
 
 ## Known limitations / ops notes
 
-- Opaque reasoning items are not threaded between turns; long sessions
-  re-derive context from message history.
-- Mid-stream cancellation is best-effort; upstream unwinds on timeout.
+- Reasoning items are echoed between turns via `encrypted_content` within a
+  relay process; the cache is process-local so a relay restart drops it
+  (session continues — it re-derives from message history).
+- Mid-stream cancellation propagates promptly now (client disconnect aborts
+  the upstream read), but a turn that produced no deltas yet still waits on
+  the upstream timeout.
+- `codex_computer` consent is auto-accepted by relay policy — a shipped
+  product would surface it in-session. Screenshots return as saved file
+  paths, not inline image parts.
 - The TUI `/model` picker may filter catalog entries by entitlement; the
   `· Codex sub` relabel keeps canonical ids so picker filtering is unaffected
-  — only display names change.
+  — only display names change. ACP's `session/set_config_option` model
+  setter validates against canonical ids and cannot select `-native`
+  clones (client limitation).
 - Compatibility depends on undocumented Devin and Codex protocol details;
-  a Devin update can change wire fields without notice.
+  a Devin update can change wire fields without notice — drift guards fail
+  loudly (`failed_precondition`) instead of misrouting.
 - ChatGPT-subscription inference via a local login is the same model the
   codex-as-api bridge family uses; ToS gray-zone noted in the source report.
 
@@ -155,12 +185,14 @@ real tasks before treating routed Fusion as a drop-in — not claimed yet.
 ## Workshop integration path (pending)
 
 `ACPHarness` already injects per-process env. An opt-in Workshop Devin profile
-needs: launch `devin acp --model fusion-…` with
-`WINDSURF_API_SERVER_URL=http://127.0.0.1:8931` + ensure the relay is running
-(health check, spawn if down). One profile toggle — no global config change.
+needs: launch `devin acp` with
+`WINDSURF_API_SERVER_URL=http://127.0.0.1:8931/t/<relay-token>` (token from
+`~/.local/share/fusion-codex-relay/relay-token`) + ensure the relay is
+running (health check, spawn if down). One profile toggle — no global
+config change.
 
 ## Tests
 
 ```bash
-cd ~/projects/fusion-codex-relay && python3 -m unittest tests.test_relay   # 24 tests
+cd ~/projects/fusion-codex-relay && python3 -m unittest tests.test_relay   # 47 tests
 ```

@@ -39,10 +39,10 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import auth, catalog
+from . import auth, catalog, cua
 from .translate import (ClientGone, IncompleteResponse, UnsupportedRequest,
-                        call_codex, packet_to_responses_body,
-                        parse_routed_model)
+                        call_codex_with_tools, inject_computer_tool,
+                        packet_to_responses_body, parse_routed_model)
 from .wire import Message, decode, error_frame, iter_frames, text, unframe
 
 UPSTREAM = os.environ.get("WINDSURF_API_UPSTREAM", "https://server.codeium.com")
@@ -452,6 +452,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, error_frame("invalid_argument", str(e)),
                               "application/connect+proto")
 
+        # CodexComputerProvider: the Codex lead gets codex_computer when the
+        # provider is installed; its calls are executed in-relay and never
+        # reach the client. No fallback to any other computer surface.
+        executor = None
+        try:
+            provider = cua.get_provider(DATA_DIR)
+            if provider.available():
+                inject_computer_tool(req_body)
+                rec["cua_tool"] = True
+
+                def executor(call: dict, r: dict) -> str:
+                    args = json.loads(call.get("arguments") or "{}")
+                    res = provider.execute(
+                        code=args.get("code", ""),
+                        title=args.get("title", ""),
+                        timeout_ms=int(args.get("timeout_ms") or 45000),
+                        rec=r)
+                    return res["text"]
+        except Exception as e:
+            rec["cua_init_error"] = str(e)
+
         try:
             if STREAM_MODE == "delta":
                 if not self._send_stream_head("application/connect+proto"):
@@ -460,14 +481,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 def on_delta(payload: bytes) -> bool:
                     return self._write_chunk(payload)
-                tail = call_codex(req_body, rec, on_delta=on_delta)
+                tail = call_codex_with_tools(req_body, rec, on_delta=on_delta,
+                                             executor=executor)
                 for flags, payload in iter_frames(tail):
                     if not self._write_chunk(bytes([flags]) + len(payload).to_bytes(4, "big") + payload):
                         rec["client_gone"] = True
                         break
                 self._write_last_chunk()
             else:
-                out = call_codex(req_body, rec)
+                out = call_codex_with_tools(req_body, rec, executor=executor)
                 self._send(200, out, "application/connect+proto")
         except ClientGone:
             rec["client_gone"] = True  # upstream read aborted promptly
