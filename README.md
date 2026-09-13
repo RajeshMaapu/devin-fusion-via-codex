@@ -25,9 +25,19 @@ codex login                          # ChatGPT account, if not already
 ~/projects/fusion-codex-relay/bin/devin-fusion acp      # ACP (IDE/Workshop)
 ```
 
-`devin-fusion` starts the relay if needed, sets the endpoint override, and
-execs `devin` unchanged — select any `fusion-gpt-6-astra-*-sidekick-swe-2-*`
-model as usual (`--model`, `/model`, or `DEVIN_MODEL`).
+`devin-fusion` starts the relay if needed, sets the endpoint override
+(including the per-install auth token — see below), and execs `devin`
+unchanged — select any `fusion-gpt-6-astra-*-sidekick-swe-2-*` model as usual
+(`--model`, `/model`, or `DEVIN_MODEL`).
+
+### Local client authentication
+
+The relay requires every request under a `/t/<token>/` path prefix. The token
+lives in `~/.local/share/fusion-codex-relay/relay-token` (mode 0600,
+generated on first start) and the wrapper embeds it in
+`WINDSURF_API_SERVER_URL`. Localhost binding alone is not treated as
+authentication — any local process without file access to the token gets a
+403. `/healthz` stays open (liveness only); `/stats` requires the token.
 
 ### `/model` picker entries
 
@@ -70,9 +80,14 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 | `devin -p` print path | Works (same override) |
 | Prompt cache | `cached_tokens` observed flowing Codex → CLI `cachedReadTokens` |
 | Usage display | CLI `usage_update` mirrors the Codex token counts exactly |
-| `/model` route entries | 140 `-codex`/`-native` clones injected; `AssignModel` rewrite + session pin verified |
+| `/model` route entries | Canonical entries relabeled `· Codex sub`; `-native` clones added; pins commit only on upstream 2xx |
+| Pin persistence | `routes.json` survives relay restart — post-restart `-native` pin honored live |
 | Quota wall bypass | Relayed astra turn completes on a Cognition-quota-exhausted account |
 | Always-on | launchd agent `ai.maapu.fusion-relay` (RunAtLoad + KeepAlive) |
+| Cancellation | Client killed mid-stream → `client_gone`, upstream Codex read aborted |
+| Full cycle | lead→tool→sidekick→lead resume→final answer recorded end-to-end (session `infrequent-menu`) |
+| Incomplete output | `response.incomplete` → explicit `out_of_range` error, never a silent stop |
+| Buffered mode | Cumulative text frame + terminal — equivalent content to delta mode |
 
 ## Usage accounting — what actually happens
 
@@ -96,32 +111,36 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 | --- | --- | --- |
 | `FUSION_RELAY_PORT` | 8931 | Listen port |
 | `FUSION_RELAY_STREAM` | `delta` | `delta` streams text; `buffer` returns one frame |
-| `FUSION_RELAY_AUX` | `reject` | Policy for models matching no route: `reject`/`forward`/`codex` |
+| `FUSION_RELAY_AUX` | `forward` | Policy for non-astra models: `forward` (native-identical) / `reject` / `codex` |
 | `FUSION_RELAY_INSPECT` | — | RPC substrings to numerically inspect (forensics) |
 | `WINDSURF_API_UPSTREAM` | `https://server.codeium.com` | Cognition upstream |
 
 ## Files
 
 - `fusion_relay/wire.py` — protobuf/Connect codec
-- `fusion_relay/translate.py` — packet ⇄ Responses-API translation
+- `fusion_relay/translate.py` — packet ⇄ Responses-API translation, image
+  detection/reject, reasoning-continuity echo
 - `fusion_relay/auth.py` — `~/.codex/auth.json` reader + locked token refresh
-- `fusion_relay/relay.py` — HTTP server, routing, accounting
+  (single refresh owner under flock)
+- `fusion_relay/catalog.py` — picker relabel/injection, deferred session pins
+- `fusion_relay/relay.py` — HTTP server, token auth, routing, accounting
 - `bin/fusion-relay`, `bin/devin-fusion` — process manager + launch wrapper
-- `tests/test_relay.py` — `python3 -m unittest tests.test_relay`
+- `tests/test_relay.py` — `python3 -m unittest tests.test_relay` (37 tests)
 
 ## Known limitations
 
-- Opaque reasoning items are not threaded between turns (Responses
-  `include`/`encrypted_content`); long sessions re-derive context from message
-  history. No quality regression observed on probe turns, but a real A/B
-  benchmark suite is still owed.
-- Cancellation mid-Codex-stream is best-effort (client disconnect stops
-  writes; upstream read unwinds on timeout).
-- `max` effort maps to `xhigh`; `-fast` priority tier is not translatable.
+- Reasoning items are echoed between turns via `encrypted_content`
+  (`store:false` multi-turn mechanism); pre-relay-restart turns have no
+  cached items, so cross-restart context still re-derives from message
+  history.
+- `max` effort maps to `xhigh`; `-fast` priority tier is not translatable
+  (both flagged in the request record).
 - Message sources outside user/assistant/tool-output/instructions are
-  rejected (fail-closed).
+  rejected (fail-closed); unknown message fields are classified
+  image/ignore/reject — a new consequential field shape will reject loudly.
 - Compatibility depends on undocumented Devin↔server and Codex-backend
-  protocol details; a Devin update can change wire fields without notice.
+  protocol details; drift guards (`f3`/`f21` presence, catalog warnings)
+  detect schema changes rather than guess.
 - ToS note: ChatGPT-subscription inference is intended for Codex products;
   this relays a local login for local use, like the codex-as-api bridge family.
 
