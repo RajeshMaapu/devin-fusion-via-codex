@@ -6,14 +6,12 @@ over stdio and runs the ``js`` tool against the ``cua`` API (listApps,
 getApp -> getAXState/getScreenshot/click/pressKey/typeText/scroll).
 
 Consent: the surface gates first-use per app via MCP form elicitation.
-The relay has no UI, so it answers ``accept`` with ``persist: always`` —
-the grant lands in ``ComputerUseAppApprovals.json`` under the OpenAI sky
-group container, where it is auditable and revocable. Every granted app
-is recorded in the request record (bundle id only).
-
-One provider, one lock: calls are serialized, which is the mutual-
-exclusion guarantee — two concurrent Fusion sessions cannot interleave
-actions on the same desktop surface.
+The relay has no trusted dispatcher, authenticated consent UI, or
+qualified runtime contract, so the provider is disabled outright:
+``available()`` is False, elicitations are declined (unknown methods get
+a protocol error), and ``execute()`` raises ``computer_policy_denied``.
+A local lock inside this relay cannot fence other processes on the
+desktop either way.
 
 Failure policy: a dead or unspawnable provider raises CuaUnavailable,
 which the caller turns into an explicit ``computer_unavailable`` tool
@@ -22,7 +20,6 @@ result — never a silent fallback to anything else.
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import pathlib
@@ -38,7 +35,9 @@ CUA_REPL = CUA_NODE / "lib" / "node_modules" / "@oai" / "cua-repl" / "bin" / "cu
 NODE_REPL = CUA_NODE / "bin" / "node_repl"
 SERVICE_APP = CODEX_HOME / "computer-use" / "Codex Computer Use.app"
 
-CUA_ENABLED = os.environ.get("FUSION_RELAY_CUA", "1") != "0"
+# No environment flag may enable this: the trusted dispatch/consent
+# contracts the provider requires do not exist yet.
+CUA_ENABLED = False
 
 
 class CuaUnavailable(RuntimeError):
@@ -54,7 +53,6 @@ class CuaProvider:
         self._buf = b""
         self._lock = threading.Lock()
         self._next_id = 1
-        self._granted: list[str] = []
 
     # -- lifecycle ---------------------------------------------------------
     def _env(self) -> dict:
@@ -73,21 +71,25 @@ class CuaProvider:
             "BROWSER_USE_TINYSKY_ENABLED": "1",
             "BROWSER_USE_AVAILABLE_BACKENDS": "chrome,iab",
             "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "prod",
-            "BROWSER_USE_CODEX_APP_VERSION": "26.908.40834",
             "CODEX_CLI_PATH": str(CHATGPT_RESOURCES / "codex"),
             "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "1000",
         })
         return env
 
     def available(self) -> bool:
-        return (CUA_ENABLED and CUA_REPL.exists() and NODE_REPL.exists()
-                and SERVICE_APP.exists())
+        return False
+
+    def compatibility(self) -> dict:
+        return {"status": "blocked",
+                "reason": "trusted_dispatch_consent_and_runtime_contract_unavailable",
+                "computer_enabled": False,
+                "vision": "vision_unavailable"}
 
     def _ensure(self) -> None:
-        if self._proc and self._proc.poll() is None:
-            return
         if not self.available():
             raise CuaUnavailable("cua_repl or Codex Computer Use.app missing")
+        if self._proc and self._proc.poll() is None:
+            return
         self._proc = subprocess.Popen(
             [str(CUA_NODE / "bin" / "node"), str(CUA_REPL)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -105,12 +107,34 @@ class CuaProvider:
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def _kill(self) -> None:
-        if self._proc:
+        """Terminate the child and confirm it exited before clearing _proc.
+
+        A process that will not die stays referenced so no replacement is
+        spawned while the old one is unconfirmed.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
             try:
-                self._proc.terminate()
+                proc.kill()
             except OSError:
                 pass
-            self._proc = None
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        except OSError:
+            pass
+        if proc.poll() is None:
+            raise CuaUnavailable("cua_repl process did not terminate")
+        self._proc = None
 
     # -- jsonrpc -----------------------------------------------------------
     def _send(self, obj: dict) -> None:
@@ -140,7 +164,7 @@ class CuaProvider:
                     msg = json.loads(line)
                 except ValueError:
                     continue
-                if "elicitation" in str(msg.get("method", "")):
+                if "method" in msg and "id" in msg:
                     self._answer_elicitation(msg)
                     continue
                 if msg.get("id") == rid:
@@ -151,15 +175,18 @@ class CuaProvider:
         return None
 
     def _answer_elicitation(self, msg: dict) -> None:
-        """Auto-grant per-app consent; the store persists it (auditable)."""
-        params = msg.get("params") or {}
-        meta = params.get("_meta") or {}
-        app = (meta.get("tool_params") or {}).get("app", "")
-        if app and app not in self._granted:
-            self._granted.append(app)
-        self._send({"jsonrpc": "2.0", "id": msg["id"], "result": {
-            "action": "accept",
-            "content": {"persist": "always", "confirmed": True}}})
+        """Decline every consent request: the relay has no authenticated
+        consent UI, so nothing the app or model sends can be trusted as a
+        grant. Unknown request methods get a protocol error."""
+        rid = msg.get("id")
+        if rid is None:
+            return
+        if msg.get("method") != "elicitation/create":
+            self._send({"jsonrpc": "2.0", "id": rid, "error": {
+                "code": -32601, "message": "Unsupported elicitation method"}})
+            return
+        self._send({"jsonrpc": "2.0", "id": rid,
+                    "result": {"action": "decline"}})
 
     # -- public api --------------------------------------------------------
     def execute(self, code: str, title: str, timeout_ms: int,
@@ -170,6 +197,10 @@ class CuaProvider:
         text so the model sees the explicit error. Provider-level failures
         raise CuaUnavailable.
         """
+        if not self.available():
+            raise CuaUnavailable(
+                "computer_policy_denied: trusted dispatcher, consent UI, "
+                "and qualified runtime required")
         with self._lock:
             self._ensure()
             assert self._proc is not None
@@ -187,26 +218,16 @@ class CuaProvider:
                         "images": []}
             result = resp.get("result") or {}
             texts, images = [], []
-            for i, block in enumerate(result.get("content") or []):
+            for block in result.get("content") or []:
                 btype = block.get("type")
                 if btype == "text":
-                    t = block.get("text", "")
-                    if t.startswith("## Computer Use"):
-                        continue  # first-use doc block, not a result
-                    texts.append(t)
+                    texts.append(block.get("text", ""))
                 elif btype == "image" and block.get("data"):
-                    shots = self._data_dir / "cua-shots"
-                    shots.mkdir(parents=True, exist_ok=True)
-                    path = shots / f"shot-{int(time.time())}-{i}.png"
-                    path.write_bytes(base64.b64decode(block["data"]))
-                    images.append(str(path))
+                    texts.append("vision_unavailable: runtime image "
+                                 "contract is not qualified")
             out = "\n".join(texts)
-            for path in images:
-                out += f"\n[screenshot saved: {path}]"
             if result.get("isError"):
                 out = "computer error: " + (out or "unknown")
-            if self._granted:
-                rec["cua_approved_apps"] = list(self._granted)
             return {"text": out or "(no output)", "images": images}
 
 

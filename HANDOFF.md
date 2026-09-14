@@ -1,5 +1,18 @@
 # Implementation Handoff — fusion-codex-relay
 
+> **Historical baseline — read first.** The sections below describe the
+> pre-remediation prototype. Since then (uncommitted diff on `60224b1`):
+> computer use is **disabled fail-closed** (no trusted dispatcher,
+> consent UI, or role binding; native dispatcher enforcement remains an
+> external gap); `auth.py` is **read-only** (no refresh/lock/rewrite —
+> refresh is owned by `codex login`); route state is a **versioned**
+> `routes.json` with durable pending selections (incompatible with the
+> old reader); logging is allowlist-sanitized; transport is bounded; and
+> `/capabilities` reports the unsupported surfaces. For the current
+> measured state and R01–R11 statuses see **validation.md**. Treat every
+> "verified live"/"Implemented" claim below as historical observation,
+> not current behavior.
+
 ## What this is
 
 A local Connect-RPC translation relay that sits between the Devin CLI and
@@ -80,20 +93,33 @@ Manage: `launchctl kickstart -k gui/$(id -u)/ai.maapu.fusion-relay` (restart),
 | --- | --- |
 | `fusion_relay/wire.py` | Protobuf + Connect frame codec (varint/len/32/64-bit; frame = 1-byte flags + 4-byte length + payload; `0x02` trailer, `0x01` gzip) |
 | `fusion_relay/translate.py` | `GetChatMessage` packet → Responses-API body; SSE stream → wire messages. Model-id suffix → `reasoning.effort` (`-max`→`xhigh`, `-fast` stripped with note) |
-| `fusion_relay/auth.py` | Reads `~/.codex/auth.json` (ChatGPT mode only); refreshes via `auth.openai.com/oauth/token` under flock + atomic rename; never logs tokens |
+| `fusion_relay/auth.py` | Reads `~/.codex/auth.json` (ChatGPT mode only). **Current:** read-only — no refresh, lock, or write; expired login fails closed telling the operator to renew in Codex |
 | `fusion_relay/relay.py` | `ThreadingHTTPServer` on 127.0.0.1; routing table, verbatim forwarder, delta/buffer streaming, JSONL accounting, `/healthz` `/stats` |
-| `fusion_relay/cua.py` | CodexComputerProvider: persistent `cua_repl` MCP child, per-app consent auto-grants, serialized calls, `computer_unavailable`/`computer_policy_denied` errors |
+| `fusion_relay/cua.py` | CodexComputerProvider, **currently blocked**: `available()`→False, elicitations declined, `execute` raises `computer_policy_denied`; surfaced via `/capabilities` |
+| `fusion_relay/storage.py` | Private state I/O: 0700 dirs, `O_NOFOLLOW` reads/appends, atomic 0600 writes, `store_owner` data-dir flock |
+| `fusion_relay/operations.py` | SQLite `OperationJournal` for explicit fake-actuator callers — local contract, not a desktop lease |
+| `fusion_relay/lifecycle.py` | `RequestContext`/`RequestCancelled` — boundary-observed cancellation |
+| `fusion_relay/usage.py` | Usage accounting: per-response records + aggregate totals, unknown never coerced to zero |
 | `bin/fusion-relay` | start/stop/status/stats/fg process manager |
 | `bin/devin-fusion` | devin launcher with the override |
 | `fusion_relay/catalog.py` | `GetCliModelConfigs` rewrite: relabel astra/fusion-astra entries `· Codex sub`, append `-native` clones; `AssignModel` suffix strip + `session_uuid → route` pinning |
-| `tests/test_relay.py` | 47 unit tests: codec, routing, translation, catalog, pins, tool loop, privacy regression |
+| `tests/` | Unit + loopback-socket suites; run `python3 -m unittest discover -s tests -v` (measured run in validation.md) |
 
 Runtime state (never committed): `~/.local/share/fusion-codex-relay/` —
 `requests.jsonl` (per-request sanitized records), `relay.log`, `relay.pid`,
-`stats.json`, `routes.json`, `relay-token` (0600), `cua-shots/` (PNGs the
-computer tool captures).
+`stats.json`, `routes.json` (v2: routes + revisions + pending — **not
+readable by the old flat-map reader**), `relay-token` (0600). (`cua-shots/`
+is no longer written — image feedback is `vision_unavailable`.)
 
-## Codex computer use (`codex_computer` tool)
+## Codex computer use (`codex_computer` tool) — DISABLED
+
+**Current state: fail-closed.** The implementation below is retained as
+historical design notes. There is no trusted dispatcher, no authenticated
+consent UI, no role binding, and no qualified runtime contract, so the
+relay rejects `codex_computer` injection, declines elicitations, never
+spawns `cua_repl`, and reports the surface as blocked via
+`GET /t/<token>/capabilities`. Do not read this section as a supported
+capability.
 
 Codex-routed turns get one extra function tool, `codex_computer`, injected
 into the Responses request. Calls to it are executed inside the relay —
@@ -194,5 +220,6 @@ config change.
 ## Tests
 
 ```bash
-cd ~/projects/fusion-codex-relay && python3 -m unittest tests.test_relay   # 47 tests
+cd ~/projects/fusion-codex-relay && PYTHONDONTWRITEBYTECODE=1 \
+    python3 -m unittest discover -s tests -v   # measured run in validation.md
 ```

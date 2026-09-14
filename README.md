@@ -1,5 +1,14 @@
 # fusion-codex-relay
 
+> **Remediation state (2026-09):** this tree contains an uncommitted
+> hardening pass on top of the prototype described below. Computer use is
+> **disabled** — there is no trusted dispatcher, consent UI, or role
+> binding, and native (non-relay) tool dispatch is **not** enforced by
+> this relay. Credentials are read-only (no automatic refresh). The
+> "verified" table below describes the **historical** prototype state;
+> current verified coverage is in [validation.md](validation.md). Nothing
+> here has been qualified against live services.
+
 Route Devin **Fusion's Astra lead** inference through your local
 **ChatGPT-authenticated Codex** subscription, while the SWE-2 sidekick and all
 control-plane traffic keep their native Cognition routes.
@@ -56,8 +65,9 @@ runs without catalog) — the picker is the way to reach it.
 ### Default model
 
 `~/.config/devin/config.json` `agent.model` is set to
-`fusion-gpt-6-astra-high-sidekick-swe-2-medium` (verified: fresh session
-picks it up and routes the lead to Codex). In a plain `devin` session the
+`fusion-gpt-6-astra-high-sidekick-swe-2-medium` (historically verified in
+the prototype: a fresh session picked it up and routed the lead to Codex —
+not re-qualified after this hardening). In a plain `devin` session the
 same default hits the native Cognition path — and its quota — so run
 everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 
@@ -66,7 +76,10 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 ~/projects/fusion-codex-relay/bin/fusion-relay stop
 ```
 
-## What is verified (this build, devin 3000.10.21)
+## What was verified historically (prototype, devin 3000.10.21)
+
+These results predate the remediation hardening — see
+[validation.md](validation.md) for the current measured gate.
 
 | Behavior | Result |
 | --- | --- |
@@ -102,8 +115,12 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
   update"** — Devin's displayed quota comes from Cognition's replies, which
   the relay forwards verbatim (forging them would be wrong).
 - **Relay side:** `~/.local/share/fusion-codex-relay/requests.jsonl` records
-  per-request route, model, HTTP status, token usage, latency — sanitized,
-  no credentials, no message bodies.
+  per-request route, HTTP status, token usage, latency — allowlist
+  sanitized, no credentials, no message bodies. Note the boundary:
+  `/stats` and the log carry **aggregates** (which may be partial —
+  `unknown_calls`/`missing_fields`), while the wire response carries
+  **per-response** usage only and omits unknown counts rather than
+  reporting zero.
 
 ## Environment knobs
 
@@ -112,7 +129,7 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 | `FUSION_RELAY_PORT` | 8931 | Listen port |
 | `FUSION_RELAY_STREAM` | `delta` | `delta` streams text; `buffer` returns one frame |
 | `FUSION_RELAY_AUX` | `forward` | Policy for non-astra models: `forward` (native-identical) / `reject` / `codex` |
-| `FUSION_RELAY_INSPECT` | — | RPC substrings to numerically inspect (forensics) |
+| `FUSION_RELAY_INSPECT` | — | No-op retained for compatibility — request inspection was removed with request-head capture |
 | `WINDSURF_API_UPSTREAM` | `https://server.codeium.com` | Cognition upstream |
 
 ## Files
@@ -120,12 +137,22 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
 - `fusion_relay/wire.py` — protobuf/Connect codec
 - `fusion_relay/translate.py` — packet ⇄ Responses-API translation, image
   detection/reject, reasoning-continuity echo
-- `fusion_relay/auth.py` — `~/.codex/auth.json` reader + locked token refresh
-  (single refresh owner under flock)
-- `fusion_relay/catalog.py` — picker relabel/injection, deferred session pins
+- `fusion_relay/auth.py` — read-only `~/.codex/auth.json` reader; refresh is
+  owned by Codex (`codex login`), never by this process
+- `fusion_relay/catalog.py` — picker relabel/injection, versioned durable
+  route state with pending selections
+- `fusion_relay/storage.py` — private-dir/atomic-write/bounded-read/flock
+  helpers; `store_owner` single-process data-dir lock
+- `fusion_relay/operations.py` — SQLite operation journal for explicit
+  actuator callers (local contract only — not a desktop lease)
+- `fusion_relay/lifecycle.py` — request cancellation context
+- `fusion_relay/usage.py` — usage accounting (per-response + aggregate)
+- `fusion_relay/cua.py` — computer-use provider, currently **blocked**;
+  `GET /t/<token>/capabilities` reports the explicit unsupported surface
 - `fusion_relay/relay.py` — HTTP server, token auth, routing, accounting
 - `bin/fusion-relay`, `bin/devin-fusion` — process manager + launch wrapper
-- `tests/test_relay.py` — `python3 -m unittest tests.test_relay` (37 tests)
+- `tests/` — `python3 -m unittest discover -s tests -v` (see
+  validation.md for the measured run)
 
 ## Known limitations
 
@@ -143,6 +170,16 @@ everything through `devin-fusion`. Backup: `config.json.fusion-relay-backup`.
   detect schema changes rather than guess.
 - ToS note: ChatGPT-subscription inference is intended for Codex products;
   this relays a local login for local use, like the codex-as-api bridge family.
+- Computer use is disabled (fail-closed): no trusted dispatcher, consent UI,
+  or runtime contract. `/capabilities` reports this explicitly.
+- Transport is bounded (64 MiB bodies, capped frames/SSE, 32 concurrent
+  handlers) but buffered — not streaming backpressure — and header reads
+  have an idle timeout only, not a total deadline.
+- Auth is read-only: an expired Codex login returns an explicit error
+  telling the operator to renew it in Codex; the relay never refreshes.
+- Route state is single-writer (data-dir flock in `serve`); the v2
+  `routes.json` format is not readable by older builds — see
+  validation.md before rolling anything back.
 
 ## Benchmark-parity note
 

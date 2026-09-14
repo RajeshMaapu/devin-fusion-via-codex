@@ -20,6 +20,8 @@ Message = dict[int, list[FieldValue]]
 
 FLAG_COMPRESSED = 0x01
 FLAG_TRAILER = 0x02
+MAX_FRAME_PAYLOAD = 64 << 20
+MAX_FRAMES = 1024
 
 
 def varint(n: int) -> bytes:
@@ -100,22 +102,58 @@ def unframe(buf: bytes) -> tuple[int, bytes]:
     if len(buf) < 5:
         raise ValueError("truncated frame header")
     flags = buf[0]
+    if flags not in (0, FLAG_COMPRESSED, FLAG_TRAILER):
+        raise ValueError(f"invalid frame flags {flags}")
     length = struct.unpack(">I", buf[1:5])[0]
+    if length > MAX_FRAME_PAYLOAD:
+        raise ValueError("frame payload too large")
     if len(buf) < 5 + length:
         raise ValueError("truncated frame payload")
     return flags, buf[5 : 5 + length]
 
 
-def iter_frames(buf: bytes) -> list[tuple[int, bytes]]:
-    """Split a buffer into all its Connect frames."""
+def iter_frames(buf) -> list[tuple[int, bytes]]:
+    """Split a buffer into all its Connect frames.
+
+    Strict: rejects truncated headers/payloads, invalid flags, more than
+    MAX_FRAMES frames, and any bytes after the end-of-stream trailer
+    (including another frame). Reads through a memoryview; returned
+    payloads are plain bytes.
+    """
+    view = memoryview(buf)
     frames = []
     pos = 0
-    while pos + 5 <= len(buf):
-        flags = buf[pos]
-        length = struct.unpack(">I", buf[pos + 1 : pos + 5])[0]
-        frames.append((flags, buf[pos + 5 : pos + 5 + length]))
-        pos += 5 + length
+    while pos < len(view):
+        if len(frames) >= MAX_FRAMES:
+            raise ValueError("too many frames")
+        flags, payload = unframe(view[pos:])
+        if frames and frames[-1][0] & FLAG_TRAILER:
+            raise ValueError("bytes after end-of-stream trailer")
+        frames.append((flags, bytes(payload)))
+        pos += 5 + len(payload)
     return frames
+
+
+def bounded_decompress(payload: bytes, limit: int = MAX_FRAME_PAYLOAD) -> bytes:
+    """Gunzip *payload* with a hard output cap.
+
+    Rejects streams exceeding *limit*, truncated streams, concatenated
+    gzip members, and trailing garbage.
+    """
+    import zlib
+
+    if type(limit) is not int or limit < 0:
+        raise ValueError("invalid decompress limit")
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(payload, limit + 1)
+    except zlib.error:
+        raise ValueError("invalid compressed frame")
+    if len(out) > limit or d.unconsumed_tail:
+        raise ValueError("decompressed frame too large")
+    if not d.eof or d.unused_data:
+        raise ValueError("invalid compressed frame")
+    return out
 
 
 TypedMessage = dict[int, list[tuple[FieldValue, int]]]

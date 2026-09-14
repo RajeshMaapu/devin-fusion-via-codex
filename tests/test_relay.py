@@ -13,7 +13,7 @@ import pathlib
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from fusion_relay import wire
-from fusion_relay import catalog, relay, translate
+from fusion_relay import catalog, operations, relay, translate
 from fusion_relay.relay import route_for_model
 from fusion_relay.translate import (IncompleteResponse, UnsupportedRequest,
                                     packet_to_responses_body,
@@ -50,6 +50,33 @@ class WireCodecTest(unittest.TestCase):
     def test_truncated_frame_rejected(self) -> None:
         with self.assertRaises(ValueError):
             wire.unframe(b"\x00\x00\x00\x00")
+
+    def test_unframe_rejects_invalid_flags(self) -> None:
+        with self.assertRaises(ValueError):
+            wire.unframe(bytes([0x04]) + b"\x00\x00\x00\x01x")
+
+    def test_unframe_rejects_truncated_payload(self) -> None:
+        with self.assertRaises(ValueError):
+            wire.unframe(b"\x00\x00\x00\x00\x09abc")
+
+    def test_unframe_rejects_oversized_payload(self) -> None:
+        big = b"\x00" + (wire.MAX_FRAME_PAYLOAD + 1).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            wire.unframe(big)
+
+    def test_iter_frames_rejects_trailing_garbage(self) -> None:
+        with self.assertRaises(ValueError):
+            wire.iter_frames(wire.frame(b"ok") + b"\x00\x00")
+
+    def test_iter_frames_rejects_bytes_after_trailer(self) -> None:
+        end = wire.end_stream()
+        with self.assertRaises(ValueError):
+            wire.iter_frames(wire.frame(b"ok") + end + wire.frame(b"late"))
+
+    def test_iter_frames_rejects_too_many_frames(self) -> None:
+        buf = wire.frame(b"") * (wire.MAX_FRAMES + 1)
+        with self.assertRaises(ValueError):
+            wire.iter_frames(buf)
 
     def test_error_frame_shape(self) -> None:
         flags, payload = wire.unframe(wire.error_frame("internal", "boom"))
@@ -201,7 +228,7 @@ class TranslateTest(unittest.TestCase):
 
     def test_reasoning_items_echoed_before_last_assistant_turn(self) -> None:
         seed = "sess-42"
-        key = translate._cache_key(seed)
+        key = translate._cache_key(seed, "scope-x")
         reasoning = [{"type": "reasoning", "encrypted_content": "BLOB",
                       "summary": []}]
         translate._stash_reasoning(key, reasoning + [
@@ -213,7 +240,7 @@ class TranslateTest(unittest.TestCase):
         user2 = wire.field(2, 1) + wire.field(3, "followup")
         body = packet_to_responses_body(
             self._packet(user1, asst, user2, seed=seed),
-            parse_routed_model("x"), {})
+            parse_routed_model("x"), {}, continuity_scope="scope-x")
         kinds = [(i.get("type"), i.get("role")) for i in body["input"]]
         # reasoning inserted immediately before the last assistant turn
         self.assertEqual(kinds, [
@@ -234,9 +261,22 @@ class _FakeSSE:
     def __init__(self, events: list[dict], status: int = 200) -> None:
         self._lines = [b"data: " + json.dumps(e).encode() + b"\n"
                        for e in events]
+        self._pending = b""
         self.status = status
         self.headers: dict = {}
         self.closed = False
+
+    def readline(self, limit: int = -1):
+        if not self._pending:
+            if not self._lines:
+                return b""
+            self._pending = self._lines.pop(0)
+        line = self._pending
+        if limit < 0 or len(line) <= limit:
+            self._pending = b""
+            return line
+        out, self._pending = line[:limit], line[limit:]
+        return out
 
     def __iter__(self):
         return iter(self._lines)
@@ -429,6 +469,12 @@ class RelayToolLoopTest(unittest.TestCase):
     def setUp(self) -> None:
         translate.reset()
         self._orig = translate.call_codex
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.journal = operations.OperationJournal(
+            pathlib.Path(self._tmpdir.name) / "ops.db")
+        self.addCleanup(self.journal.close)
+        self._ctx = {"journal": self.journal, "operation_scope": "test-scope"}
 
     def tearDown(self) -> None:
         translate.call_codex = self._orig  # type: ignore
@@ -466,19 +512,19 @@ class RelayToolLoopTest(unittest.TestCase):
         return {"type": "function_call", "call_id": cid,
                 "name": "shell", "arguments": "{}"}
 
-    def test_inject_tool_once(self) -> None:
+    def test_inject_tool_rejected_without_trusted_context(self) -> None:
         body: dict = {"tools": [{"name": "shell"}]}
-        translate.inject_computer_tool(body)
-        translate.inject_computer_tool(body)
-        names = [t["name"] for t in body["tools"]]
-        self.assertEqual(names, ["shell", translate.CUA_TOOL_NAME])
+        with self.assertRaises(UnsupportedRequest):
+            translate.inject_computer_tool(body)
+        self.assertEqual(body, {"tools": [{"name": "shell"}]})
 
     def test_internal_loop_executes_and_continues(self) -> None:
         ran: list[str] = []
         calls = self._queue([[self._cua_call()], []])
         out = translate.call_codex_with_tools(
             {"prompt_cache_key": "k", "input": []}, {},
-            executor=lambda c, r: ran.append(c["call_id"]) or "RESULT_OK")
+            executor=lambda c, r: ran.append(c["call_id"]) or "RESULT_OK",
+            **self._ctx)
         self.assertEqual(ran, ["c1"])
         self.assertEqual(len(calls), 2)
         # second request input carries verbatim call + our output
@@ -493,7 +539,7 @@ class RelayToolLoopTest(unittest.TestCase):
         calls = self._queue([[self._cua_call(), self._native_call()]])
         out = translate.call_codex_with_tools(
             {"prompt_cache_key": "kk", "input": []}, {},
-            executor=lambda c, r: "DONE")
+            executor=lambda c, r: "DONE", **self._ctx)
         # emitted wire carries only the native call
         frames = [p for f, p in wire.iter_frames(out) if not f & 0x02]
         names = [wire.text(wire.decode(v), 2)
@@ -508,7 +554,7 @@ class RelayToolLoopTest(unittest.TestCase):
 
     def test_stashed_items_reinjected_next_request(self) -> None:
         translate.stash_relay_items(
-            translate._cache_key("seed-9"),
+            translate._cache_key("seed-9", "scope-y"),
             [{"type": "function_call", "call_id": "cx",
               "name": translate.CUA_TOOL_NAME, "arguments": "{}"},
              {"type": "function_call_output", "call_id": "cx",
@@ -522,7 +568,8 @@ class RelayToolLoopTest(unittest.TestCase):
                 + wire.field(16, "seed-9") + wire.field(21, "gpt-6-astra-high"))
         rec: dict = {}
         req = packet_to_responses_body(wire.decode(body),
-                                       parse_routed_model("x"), rec)
+                                       parse_routed_model("x"), rec,
+                                       continuity_scope="scope-y")
         self.assertEqual(rec["relay_items_reinjected"], 2)
         kinds = [(i.get("type"), i.get("call_id")) for i in req["input"]]
         pos = kinds.index(("function_call", "cx"))
@@ -543,10 +590,132 @@ class RelayToolLoopTest(unittest.TestCase):
     def test_loop_bound_stops_runaway(self) -> None:
         self._queue([[self._cua_call(f"c{i}")] for i in range(25)])
         rec: dict = {}
-        translate.call_codex_with_tools(
-            {"prompt_cache_key": "k", "input": []}, rec,
-            executor=lambda c, r: "ok")
+        with self.assertRaises(IncompleteResponse) as ctx:
+            translate.call_codex_with_tools(
+                {"prompt_cache_key": "k", "input": []}, rec,
+                executor=lambda c, r: "ok", **self._ctx)
+        self.assertIn("tool_budget_exhausted", str(ctx.exception))
         self.assertTrue(rec.get("relay_tool_loop_bound"))
+
+    def test_budget_one_exhausts_on_our_call(self) -> None:
+        self._queue([[self._cua_call("c1")]])
+        rec: dict = {}
+        with self.assertRaises(IncompleteResponse):
+            translate.call_codex_with_tools(
+                {"prompt_cache_key": "k", "input": []}, rec,
+                executor=lambda c, r: "ok", max_loops=1, **self._ctx)
+        self.assertTrue(rec.get("relay_tool_loop_bound"))
+
+    def test_budget_two_completes_when_calls_stop(self) -> None:
+        calls = self._queue([[self._cua_call("c1")], []])
+        out = translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, {},
+            executor=lambda c, r: "ok", max_loops=2, **self._ctx)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(out)
+
+    def test_budget_two_exhausts_on_repeated_our_calls(self) -> None:
+        self._queue([[self._cua_call("c1")], [self._cua_call("c2")]])
+        rec: dict = {}
+        with self.assertRaises(IncompleteResponse):
+            translate.call_codex_with_tools(
+                {"prompt_cache_key": "k", "input": []}, rec,
+                executor=lambda c, r: "ok", max_loops=2, **self._ctx)
+        self.assertTrue(rec.get("relay_tool_loop_bound"))
+
+    def test_budget_max_exhausts(self) -> None:
+        self._queue([[self._cua_call(f"c{i}")]
+                     for i in range(translate.MAX_TOOL_LOOPS + 1)])
+        rec: dict = {}
+        with self.assertRaises(IncompleteResponse):
+            translate.call_codex_with_tools(
+                {"prompt_cache_key": "k", "input": []}, rec,
+                executor=lambda c, r: "ok",
+                max_loops=translate.MAX_TOOL_LOOPS, **self._ctx)
+        self.assertTrue(rec.get("relay_tool_loop_bound"))
+
+    def test_mixed_final_native_only_returned(self) -> None:
+        calls = self._queue([[self._cua_call("c1")], [self._native_call()]])
+        out = translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, {},
+            executor=lambda c, r: "ok", max_loops=4, **self._ctx)
+        self.assertEqual(len(calls), 2)
+        frames = [p for f, p in wire.iter_frames(out) if not f & 0x02]
+        names = [wire.text(wire.decode(v), 2)
+                 for v in wire.decode(frames[-1]).get(6, [])]
+        self.assertEqual(names, ["shell"])  # only the unexecuted native call
+
+    def test_invalid_budget_rejected_before_inference(self) -> None:
+        calls = self._queue([[]])
+        for bad in (0, -1, translate.MAX_TOOL_LOOPS + 1, True):
+            with self.assertRaises(ValueError):
+                translate.call_codex_with_tools(
+                    {"prompt_cache_key": "k", "input": []}, {},
+                    executor=lambda c, r: "ok", max_loops=bad)
+        self.assertEqual(calls, [])  # no inference ran
+
+    def test_duplicate_call_id_dispatched_once(self) -> None:
+        ran: list[str] = []
+        calls = self._queue([[self._cua_call("c1"), self._cua_call("c1")], []])
+        translate.call_codex_with_tools(
+            {"prompt_cache_key": "k", "input": []}, {},
+            executor=lambda c, r: ran.append(c["call_id"]) or "OK",
+            max_loops=4, **self._ctx)
+        self.assertEqual(ran, ["c1"])  # identical duplicate deduped to one pair
+        outputs = [i.get("output") for i in calls[1]["input"]
+                   if i.get("type") == "function_call_output"]
+        self.assertEqual(outputs, ["OK"])
+
+    def test_conflicting_call_id_reuse_denied(self) -> None:
+        other = self._cua_call("c1")
+        other["arguments"] = '{"code":"console.log(2)"}'
+        self._queue([[self._cua_call("c1"), other], []])
+        ran: list[str] = []
+        with self.assertRaises(UnsupportedRequest):
+            translate.call_codex_with_tools(
+                {"prompt_cache_key": "k", "input": []}, {},
+                executor=lambda c, r: ran.append(c["call_id"]) or "OK",
+                max_loops=4, **self._ctx)
+        self.assertEqual(ran, [])  # zero actions on id collision
+
+    def test_reissued_id_stash_keeps_single_pair(self) -> None:
+        calls = self._queue([[self._cua_call()],
+                             [self._cua_call(), self._native_call("n2")]])
+        out = translate.call_codex_with_tools(
+            {"prompt_cache_key": "krep", "input": []}, {},
+            executor=lambda c, r: "DONE", **self._ctx)
+        # emitted wire carries only the native call
+        frames = [p for f, p in wire.iter_frames(out) if not f & 0x02]
+        names = [wire.text(wire.decode(v), 2)
+                 for v in wire.decode(frames[-1]).get(6, [])]
+        self.assertEqual(names, ["shell"])
+        # stash has exactly one call+output pair for c1
+        with translate._relay_items_lock:
+            stashed = translate._relay_items_cache["krep"]
+        self.assertEqual(
+            [(i["type"], i.get("call_id")) for i in stashed],
+            [("function_call", "c1"), ("function_call_output", "c1")])
+
+    def test_drop_tool_calls_undecodable_nested_rejected(self) -> None:
+        msg = (wire.field(1, "r")
+               + wire.field(6, b"\x0b")  # truncated varint payload
+               + wire.field(5, 10))
+        tail = wire.frame(msg) + wire.end_stream()
+        with self.assertRaises(UnsupportedRequest):
+            translate._drop_tool_calls(tail, {"codex_computer"}, {})
+
+    def test_drop_tool_calls_preserves_error_trailer(self) -> None:
+        msg = (wire.field(1, "r")
+               + wire.field(6, wire.field(1, "c1")
+                            + wire.field(2, "codex_computer")
+                            + wire.field(3, "{}"))
+               + wire.field(5, 10))
+        trailer_payload = b'{"error":{"code":"resource_exhausted"}}'
+        trailer = bytes([0x02]) + len(trailer_payload).to_bytes(4, "big") \
+            + trailer_payload
+        tail = wire.frame(msg) + trailer
+        out = translate._drop_tool_calls(tail, {"codex_computer"}, {})
+        self.assertTrue(out.endswith(trailer))
 
     def test_drop_tool_calls_preserves_usage_and_id(self) -> None:
         tail = (wire.frame(

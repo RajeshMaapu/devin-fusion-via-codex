@@ -1,5 +1,16 @@
 # Response — "Support external lead inference in native Fusion"
 
+> **Historical baseline — read first.** This document reports the
+> pre-remediation prototype state. Since then (uncommitted diff on
+> `60224b1`): computer use is **disabled fail-closed** — the "Implemented"
+> claims for item 5 describe a surface that no longer dispatches (no
+> trusted dispatcher, consent UI, role binding, or qualified runtime; the
+> native tool dispatcher remains an unenforced external gap); auth is
+> read-only; route state is versioned; logging is allowlist-sanitized.
+> For the current remediation status per item (R01–R11, several still
+> **Blocked**/**Partial**) see **validation.md**. Nothing below should be
+> read as a current supported capability.
+
 Status per item: **Implemented** · **Tested successfully** · **Failed** ·
 **Unsupported** (needs vendor/provider action) · **Not yet tested**.
 

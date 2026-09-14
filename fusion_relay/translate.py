@@ -34,8 +34,10 @@ the documented store:false multi-turn mechanism.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
+import math
 import threading
 import urllib.error
 import urllib.request
@@ -43,6 +45,8 @@ from dataclasses import dataclass, field as dc_field
 from typing import Callable, Iterator, Optional
 
 from . import auth
+from .lifecycle import RequestCancelled
+from .usage import normalized_usage, record_usage
 from .wire import Message, decode, end_stream, field, frame, iter_frames, text
 
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -65,6 +69,16 @@ IGNORABLE_FIELD_BYTES = 24
 IGNORABLE_TEXT_BYTES = 128
 
 FINISH_STOP, FINISH_TOOL_CALLS = 1, 10
+MAX_SSE_LINE = 1 << 20
+MAX_RESPONSE_BYTES = 64 << 20
+
+# Provider quota snapshot: exact names only, numeric values only, never
+# treated as an authoritative subscription balance.
+QUOTA_HEADERS = (
+    "x-codex-primary-used-percent", "x-codex-secondary-used-percent",
+    "x-codex-primary-window-minutes", "x-codex-secondary-window-minutes",
+    "x-codex-primary-reset-at", "x-codex-secondary-reset-at")
+_SAFE_INCOMPLETE = {"max_output_tokens", "content_filter"}
 
 _REASONING_CACHE_SIZE = 64
 
@@ -123,7 +137,7 @@ class IncompleteResponse(RuntimeError):
     """
 
 
-class ClientGone(RuntimeError):
+class ClientGone(RequestCancelled):
     """The CLI disconnected mid-stream; abort the upstream read."""
 
 
@@ -185,8 +199,9 @@ _reasoning_lock = threading.Lock()
 _reasoning_cache: dict[str, list[dict]] = {}
 
 
-def _cache_key(seed: str) -> str:
-    return "fusion-relay-" + hashlib.sha256(seed.encode()).hexdigest()[:32]
+def _cache_key(seed: str, scope: str = "") -> str:
+    return "fusion-relay-" + hashlib.sha256(
+        (scope + "\0" + seed).encode()).hexdigest()[:32]
 
 
 def _stash_reasoning(cache_key: str, items: list[dict]) -> None:
@@ -202,7 +217,8 @@ def _stash_reasoning(cache_key: str, items: list[dict]) -> None:
 
 
 def packet_to_responses_body(packet: Message, routed: RoutedModel,
-                             rec: dict) -> dict:
+                             rec: dict,
+                             continuity_scope: str = "") -> dict:
     """Convert a decoded GetChatMessage packet into a Responses-API body."""
     instructions: list[str] = []
     inputs: list[dict] = []
@@ -277,9 +293,16 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
                            "name": text(tc, 2), "arguments": text(tc, 3)})
 
     seed = text(packet, 16)
-    cache_key = _cache_key(seed)
-    with _reasoning_lock:
-        prior = _reasoning_cache.get(cache_key, [])
+    if not seed:
+        raise UnsupportedRequest("missing stable session seed (field 16)")
+    # Continuity caches are partitioned by a trusted caller-supplied
+    # scope (account/model/effort/role binding). Without one they stay
+    # disabled — an unscoped cache could leak across sessions.
+    cache_key = _cache_key(seed, continuity_scope)
+    prior: list[dict] = []
+    if continuity_scope:
+        with _reasoning_lock:
+            prior = _reasoning_cache.get(cache_key, [])
     if prior and last_assistant_start is not None:
         # Echo the previous turn's reasoning items ahead of the assistant
         # turn they generated — order must mirror the original output.
@@ -288,9 +311,12 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
 
     # Re-inject relay-owned tool items the client never saw (calls the
     # relay answered itself last turn). They belong after the assistant
-    # turn that emitted them — before the tool outputs that follow.
-    with _relay_items_lock:
-        pending = _relay_items_cache.pop(cache_key, [])
+    # turn that emitted them — before the tool outputs that follow. The
+    # stash is read, not consumed: delivery is not acknowledged here.
+    pending: list[dict] = []
+    if continuity_scope:
+        with _relay_items_lock:
+            pending = copy.deepcopy(_relay_items_cache.get(cache_key, []))
     if pending:
         insert_at = len(inputs)
         if last_assistant_start is not None:
@@ -325,10 +351,15 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
 
 
 def inject_computer_tool(body: dict) -> None:
-    """Offer the codex_computer tool on a Codex-bound request body."""
-    tools = body.setdefault("tools", [])
-    if not any(t.get("name") == CUA_TOOL_NAME for t in tools):
-        tools.append(dict(CUA_TOOL))
+    """Offer the codex_computer tool on a Codex-bound request body.
+
+    Blocked: there is no trusted Fusion role binding or authenticated
+    consent UI, so production relay-owned computer dispatch fails closed
+    instead of pretending authorization. The body is never mutated.
+    """
+    raise UnsupportedRequest(
+        "computer_policy_denied: trusted Fusion role binding and "
+        "consent UI unavailable")
 
 
 def stash_relay_items(cache_key: str, items: list[dict]) -> None:
@@ -340,13 +371,7 @@ def stash_relay_items(cache_key: str, items: list[dict]) -> None:
 
 
 def _record_usage(complete: dict, rec: dict) -> None:
-    usage = complete.get("usage")
-    if usage:
-        rec["codex_usage"] = {k: v for k, v in usage.items() if k != "attribution"}
-    else:
-        rec["codex_usage"] = "unknown"
-    rec["codex_model"] = complete.get("model")
-    rec["codex_status"] = complete.get("status")
+    record_usage(complete, rec)
 
 
 def _final_message(complete: dict, items: list[dict], rec: dict,
@@ -370,10 +395,14 @@ def _final_message(complete: dict, items: list[dict], rec: dict,
             has_tool = True
             result += field(6, field(1, item["call_id"]) + field(2, item["name"])
                             + field(3, item["arguments"]))
-    usage = complete.get("usage", {})
-    result += field(7, field(2, usage.get("input_tokens", 0))
-                    + field(3, usage.get("output_tokens", 0))
-                    + field(5, usage.get("input_tokens_details", {}).get("cached_tokens", 0)))
+    counts = normalized_usage(complete.get("usage"))
+    usage_payload = b"".join(
+        field(number, counts[key])
+        for number, key in ((2, "input_tokens"), (3, "output_tokens"),
+                            (5, "cached_tokens"))
+        if counts[key] is not None)
+    if usage_payload:
+        result += field(7, usage_payload)
     result += field(5, FINISH_TOOL_CALLS if has_tool else FINISH_STOP)
     return result
 
@@ -381,7 +410,9 @@ def _final_message(complete: dict, items: list[dict], rec: dict,
 def call_codex(body: dict, rec: dict,
                on_delta: Optional[Callable[[bytes], bool]] = None,
                timeout: int = 300,
-               _items_out: Optional[list] = None) -> bytes:
+               _items_out: Optional[list] = None,
+               check_cancelled: Optional[Callable[[], None]] = None,
+               credentials: Optional[tuple] = None) -> bytes:
     """Call the Codex Responses endpoint; return the complete wire stream.
 
     If *on_delta* is given it is invoked once per assistant text delta with a
@@ -396,155 +427,327 @@ def call_codex(body: dict, rec: dict,
 
     ``_items_out`` (internal) receives the completed response's output items
     so the tool-loop wrapper can inspect calls without re-decoding wire bytes.
+
+    ``check_cancelled`` is a request-lifecycle callback invoked before the
+    request, per stream event, and before the terminal message.
+    ``credentials`` is an optional ``(token, account_id)`` pair so a caller
+    can pin one auth read across cache scope and inference. Usage is
+    recorded for every terminal event (completed/incomplete/failed); a
+    started request that dies without one is tracked once in ``finally``
+    as an unknown call — a pre-request failure is not a provider response.
     """
-    token, account_id = auth.get_token()
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "ChatGPT-Account-Id": account_id,
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream",
-        "User-Agent": "fusion-codex-relay/0.2",
-    }
-    req = urllib.request.Request(CODEX_RESPONSES_URL,
-                                 data=json.dumps(body).encode(), headers=headers)
-    complete: Optional[dict] = None
-    items: list[dict] = []
-    text_parts: list[str] = []
+    check = check_cancelled or (lambda: None)
+    usage_recorded = False
+    request_started = False
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            rec["codex_http_status"] = response.status
-            rec["codex_rate_headers"] = {
-                k: v for k, v in response.headers.items()
-                if "limit" in k.lower() or "rate" in k.lower() or "codex" in k.lower()}
-            for line in response:
-                if not line.startswith(b"data: "):
-                    continue
-                data = line[6:].strip()
-                if data == b"[DONE]":
-                    continue
-                event = json.loads(data)
-                etype = event.get("type")
-                if etype == "response.output_item.done":
-                    items.append(event["item"])
-                elif etype == "response.output_text.delta":
-                    delta = event.get("delta", "")
-                    if delta:
-                        text_parts.append(delta)
-                        rec["delta_chars"] = rec.get("delta_chars", 0) + len(delta)
-                        if on_delta and on_delta(frame(field(3, delta))) is False:
-                            response.close()
-                            raise ClientGone()
-                elif etype == "response.completed":
-                    complete = event["response"]
-                elif etype == "response.incomplete":
-                    partial = event.get("response") or {}
-                    detail = (partial.get("incomplete_details") or {}).get(
-                        "reason", "unknown")
-                    rec["codex_status"] = "incomplete"
-                    rec["incomplete_reason"] = detail
-                    _record_usage(partial, rec)
-                    raise IncompleteResponse(
-                        f"codex response incomplete: {detail}")
-                elif etype in ("error", "response.failed"):
-                    rec["codex_error_type"] = etype
-                    raise RuntimeError("codex stream failed")
-    except urllib.error.HTTPError as e:
-        rec["codex_http_status"] = e.code
-        detail = e.read().decode(errors="replace")
-        rec["codex_error"] = detail[:600]
-        raise RuntimeError(f"codex HTTP {e.code}")
-    if complete is None:
-        raise RuntimeError("codex stream ended without response.completed")
-    _record_usage(complete, rec)
-    output_items = complete.get("output", []) or items
-    _stash_reasoning(body.get("prompt_cache_key", ""), output_items)
-    if _items_out is not None:
-        _items_out.extend(output_items)
-    out = b""
-    if on_delta is None and text_parts:
-        out += frame(field(3, "".join(text_parts)))
-    out += frame(_final_message(complete, items, rec)) + end_stream()
-    return out
+        check()
+        if credentials is not None:
+            token, account_id = credentials
+        else:
+            token, account_id = auth.get_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "ChatGPT-Account-Id": account_id,
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+            "User-Agent": "fusion-codex-relay/0.2",
+        }
+        req = urllib.request.Request(CODEX_RESPONSES_URL,
+                                     data=json.dumps(body).encode(),
+                                     headers=headers)
+        complete: Optional[dict] = None
+        items: list[dict] = []
+        text_parts: list[str] = []
+        total_bytes = 0
+        try:
+            request_started = True
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                rec["codex_http_status"] = response.status
+                quota = {}
+                for k in QUOTA_HEADERS:
+                    raw = response.headers.get(k)
+                    try:
+                        v = float(raw)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        continue
+                    if math.isfinite(v) and v >= 0:
+                        quota[k] = v
+                if quota:
+                    rec["codex_quota_snapshot"] = quota
+                while True:
+                    check()
+                    line = response.readline(MAX_SSE_LINE + 1)
+                    total_bytes += len(line)
+                    if len(line) > MAX_SSE_LINE or \
+                            total_bytes > MAX_RESPONSE_BYTES:
+                        raise RuntimeError("codex stream oversized")
+                    if not line:
+                        break
+                    if not line.startswith(b"data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == b"[DONE]":
+                        continue
+                    event = json.loads(data)
+                    etype = event.get("type")
+                    if etype == "response.output_item.done":
+                        items.append(event["item"])
+                    elif etype == "response.output_text.delta":
+                        delta = event.get("delta", "")
+                        if delta:
+                            text_parts.append(delta)
+                            rec["delta_chars"] = rec.get("delta_chars", 0) + len(delta)
+                            if on_delta and on_delta(frame(field(3, delta))) is False:
+                                response.close()
+                                raise ClientGone()
+                    elif etype == "response.completed":
+                        complete = event["response"]
+                        _record_usage(complete, rec)
+                        usage_recorded = True
+                    elif etype == "response.incomplete":
+                        partial = event.get("response") or {}
+                        reason = (partial.get("incomplete_details") or {}).get(
+                            "reason")
+                        detail = reason if reason in _SAFE_INCOMPLETE \
+                            else "unknown"
+                        rec["incomplete_reason"] = detail
+                        _record_usage(partial, rec)
+                        usage_recorded = True
+                        raise IncompleteResponse(
+                            f"codex response incomplete: {detail}")
+                    elif etype in ("error", "response.failed"):
+                        _record_usage(event.get("response") or {}, rec)
+                        usage_recorded = True
+                        raise RuntimeError("codex stream failed")
+        except urllib.error.HTTPError as e:
+            rec["codex_http_status"] = e.code
+            rec["error_category"] = "upstream_error"
+            e.close()
+            raise RuntimeError(f"codex HTTP {e.code}")
+        if complete is None:
+            raise RuntimeError("codex stream ended without response.completed")
+        check()
+        output_items = complete.get("output", []) or items
+        _stash_reasoning(body.get("prompt_cache_key", ""), output_items)
+        if _items_out is not None:
+            _items_out.extend(output_items)
+        out = b""
+        if on_delta is None and text_parts:
+            out += frame(field(3, "".join(text_parts)))
+        out += frame(_final_message(complete, items, rec)) + end_stream()
+        return out
+    except RequestCancelled:
+        rec["client_gone"] = True
+        raise
+    finally:
+        if request_started and not usage_recorded:
+            _record_usage(
+                {"status": "cancelled" if rec.get("client_gone") else "failed"},
+                rec)
 
 
 def call_codex_with_tools(body: dict, rec: dict,
                           on_delta: Optional[Callable[[bytes], bool]] = None,
                           executor: Optional[Callable[[dict, dict], str]] = None,
-                          max_loops: int = MAX_TOOL_LOOPS) -> bytes:
+                          max_loops: int = MAX_TOOL_LOOPS,
+                          *, journal=None,
+                          operation_scope: str = "",
+                          check_cancelled: Optional[Callable[[], None]] = None,
+                          credentials: Optional[tuple] = None) -> bytes:
     """Like call_codex, but executes relay-owned tool calls internally.
 
     ``executor(call_item, rec) -> result_text`` runs a relay-owned call.
+    An executor requires a durable ``journal`` and trusted
+    ``operation_scope`` — without them dispatch fails closed before any
+    inference. ``check_cancelled`` is invoked before/after each inference
+    and around each dispatch.
+
     Turns loop while every function_call is relay-owned. If a response mixes
     relay-owned and native calls, the relay-owned ones are executed, their
     call+output items are stashed for re-injection on the next request, and
     only native calls are emitted downstream. A stale relay-owned call with
     no executor gets ``computer_policy_denied`` — never executed.
+
+    ``max_loops`` is the iteration budget; invalid budgets are rejected
+    before any inference. Each relay-owned call is dispatched at most once
+    per ``call_id`` — a repeated id with identical name/arguments reuses
+    its result, a conflicting reuse raises ``UnsupportedRequest``.
+    Exhausting the budget sets ``relay_tool_loop_bound`` and raises
+    ``IncompleteResponse``; an already-executed call is never returned as
+    dispatchable.
     """
+    if type(max_loops) is not int or not 1 <= max_loops <= MAX_TOOL_LOOPS:
+        raise ValueError("invalid tool iteration budget")
+    if executor is not None and (journal is None or not operation_scope):
+        raise UnsupportedRequest(
+            "computer_policy_denied: durable operation context required")
+    check = check_cancelled or (lambda: None)
+    call_kwargs: dict = {}
+    if check_cancelled is not None:
+        call_kwargs["check_cancelled"] = check
+    if credentials is not None:
+        call_kwargs["credentials"] = credentials
     cache_key = body.get("prompt_cache_key", "")
+    executed: dict[str, tuple] = {}  # call_id -> (name, arguments, output)
+    executed_pairs: list[dict] = []
+
+    def run_call(call: dict) -> str:
+        cid = call["call_id"]
+        prior = executed.get(cid)
+        if prior is not None:
+            return prior[2]  # identical call id + args: cached, no redispatch
+        if executor is None:
+            output = _exec_relay_call(call, None, rec)
+        else:
+            try:
+                output = journal.run(operation_scope, call,
+                                     lambda: executor(call, rec), check)
+            except (RequestCancelled, IncompleteResponse,
+                    UnsupportedRequest):
+                raise
+            except Exception:
+                raise IncompleteResponse(
+                    "outcome_unknown: explicit reconciliation required")
+        check()
+        executed[cid] = (call.get("name"), call.get("arguments"), output)
+        return output
+
     for _ in range(max_loops):
+        check()
         items: list[dict] = []
-        tail = call_codex(body, rec, on_delta=on_delta, _items_out=items)
+        tail = call_codex(body, rec, on_delta=on_delta, _items_out=items,
+                          **call_kwargs)
+        check()
         calls = [it for it in items if it.get("type") == "function_call"]
+        # Every call id in the response must map to one fingerprint before
+        # anything dispatches — a collision (ours or native, differing
+        # name/arguments) rejects the whole response with zero actions.
+        fingerprints: dict[str, tuple] = {}
+        for c in calls:
+            cid = c.get("call_id")
+            if not isinstance(cid, str) or not cid:
+                raise UnsupportedRequest("tool call missing call_id")
+            fp = (c.get("name"), c.get("arguments"))
+            prior = fingerprints.get(cid)
+            if prior is not None and prior != fp:
+                raise UnsupportedRequest("conflicting reuse of tool call id")
+            fingerprints[cid] = fp
+            # A later-issued call id that conflicts with an already-
+            # executed fingerprint (ours or native) rejects the whole
+            # response before any current-iteration action.
+            seen = executed.get(cid)
+            if seen is not None and seen[:2] != fp:
+                raise UnsupportedRequest("conflicting reuse of tool call id")
         ours = [c for c in calls if c.get("name") == CUA_TOOL_NAME]
         if not ours:
             return tail
+        for c in ours:
+            if not isinstance(c.get("arguments"), str):
+                raise UnsupportedRequest(
+                    "relay-owned tool call arguments not a string")
+            try:
+                parsed_args = json.loads(c["arguments"])
+            except ValueError:
+                raise UnsupportedRequest(
+                    "relay-owned tool call arguments not valid JSON")
+            if not isinstance(parsed_args, dict):
+                raise UnsupportedRequest(
+                    "relay-owned tool call arguments not a JSON object")
         native = [c for c in calls if c.get("name") != CUA_TOOL_NAME]
         rec["relay_tool_calls"] = rec.get("relay_tool_calls", 0) + len(ours)
         # Replay context: raw output items plus an output right after each
-        # of our calls. For loop-continuation the whole turn replays; for a
-        # mixed finish only OUR pairs are stashed (the client's own history
-        # already carries the native call it is about to answer).
+        # of our calls. Identical call items within this response emit one
+        # pair — duplicate outputs for one call_id are provider-invalid;
+        # the same call re-issued in a later iteration re-emits with the
+        # cached result. For loop-continuation the whole turn replays; for
+        # a mixed finish only OUR pairs are stashed (the client's own
+        # history already carries the native call it is about to answer).
+        emitted: set = set()
         replay: list[dict] = []
         our_pairs: list[dict] = []
-        ours_by_id = {c.get("call_id"): c for c in ours}
+        ours_by_id = {id(c) for c in ours}
         for it in items:
-            replay.append(it)
-            if it.get("type") == "function_call" and it.get("call_id") in ours_by_id:
+            if it.get("type") == "function_call" and id(it) in ours_by_id:
+                signature = (it["call_id"], it.get("name"),
+                             it.get("arguments"))
+                if signature in emitted:
+                    continue
+                emitted.add(signature)
+                replay.append(it)
                 output_item = {"type": "function_call_output",
                                "call_id": it["call_id"],
-                               "output": _exec_relay_call(it, executor, rec)}
+                               "output": run_call(it)}
                 replay.append(output_item)
                 our_pairs.extend((it, output_item))
+            else:
+                replay.append(it)
+        our_ids = {c["call_id"] for c in our_pairs}
+        executed_pairs[:] = [p for p in executed_pairs
+                             if p.get("call_id") not in our_ids]
+        executed_pairs.extend(our_pairs)
+        if cache_key:
+            stash_relay_items(cache_key, executed_pairs)
         if not native:
-            body.setdefault("input", []).extend(replay)
+            # A call id re-issued in a later iteration re-emits its
+            # cached result; drop the older pair so the accumulated
+            # input carries exactly one call+output per call_id.
+            ours_ids = {c["call_id"] for c in ours}
+            existing = body.setdefault("input", [])
+            body["input"] = [e for e in existing if not (
+                isinstance(e, dict)
+                and e.get("type") in ("function_call",
+                                      "function_call_output")
+                and e.get("call_id") in ours_ids)]
+            body["input"].extend(replay)
             continue  # all calls were ours — keep the turn going
         # Mixed: emit only native calls; ours are re-injected next request.
-        stash_relay_items(cache_key, our_pairs)
         return _drop_tool_calls(tail, {CUA_TOOL_NAME}, rec)
     rec["relay_tool_loop_bound"] = True
-    return tail
+    raise IncompleteResponse("tool_budget_exhausted")
 
 
 def _drop_tool_calls(tail: bytes, names: set, rec: dict) -> bytes:
     """Rebuild the terminal frame minus tool calls named in ``names``.
 
     Keeps id/usage/finish fields intact and preserves any earlier frames
-    (e.g. buffered text) and the trailer.
+    (e.g. buffered text) and the original trailer bytes verbatim.
+    Malformed framing or an undecodable terminal payload raises
+    ``UnsupportedRequest`` rather than passing tool calls downstream.
     """
-    frames = iter_frames(tail)
+    try:
+        frames = iter_frames(tail)
+    except ValueError:
+        raise UnsupportedRequest("malformed response framing")
     body_frames = [(f, p) for f, p in frames if not f & 0x02]
+    trailer_raw = b"".join(bytes([f]) + len(p).to_bytes(4, "big") + p
+                           for f, p in frames if f & 0x02)
     if not body_frames:
         return tail
     last_flags, last_payload = body_frames[-1]
     try:
         msg = decode(last_payload)
     except ValueError:
-        return tail
+        raise UnsupportedRequest("undecodable response payload")
     kept: list[tuple[int, object]] = []
     for num, values in msg.items():
         for v in values:
-            if num == 6 and isinstance(v, bytes):
+            if num == 6:
+                if not isinstance(v, bytes):
+                    raise UnsupportedRequest(
+                        "undecodable tool call payload")
                 try:
-                    if text(decode(v), 2) in names:
-                        continue
+                    name = text(decode(v), 2)
                 except ValueError:
-                    pass
+                    raise UnsupportedRequest(
+                        "undecodable tool call payload")
+                if name in names:
+                    continue
             kept.append((num, v))
     rebuilt = b"".join(field(num, v) for num, v in kept)
     head = b"".join(bytes([f]) + len(p).to_bytes(4, "big") + p
                     for f, p in body_frames[:-1])
     return head + bytes([last_flags]) + len(rebuilt).to_bytes(4, "big") + rebuilt \
-        + end_stream()
+        + trailer_raw
 
 
 def _exec_relay_call(call: dict, executor: Optional[Callable], rec: dict) -> str:
@@ -553,8 +756,10 @@ def _exec_relay_call(call: dict, executor: Optional[Callable], rec: dict) -> str
                 "in this execution profile")
     try:
         return executor(call, rec)
-    except Exception as e:  # executor surfaces explicit error text
-        return f"computer_unavailable: {e}"
+    except (RequestCancelled, IncompleteResponse):
+        raise
+    except Exception:  # executor details stay out of tool results
+        return "computer_unavailable: provider execution failed"
 
 
 def reset() -> None:
