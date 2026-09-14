@@ -603,5 +603,129 @@ class ContinuityScopeTest(unittest.TestCase):
             self.assertTrue(translate._relay_items_cache)  # not consumed
 
 
+class DeliveryTest(unittest.TestCase):
+    """Durable per-consumer delivery of terminal journal results."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db = pathlib.Path(self._tmp.name) / "ops.db"
+        self.journal = operations.OperationJournal(self.db)
+        self.addCleanup(self.journal.close)
+
+    def _succeed(self, op="op1", result="RES"):
+        self.journal.run("s1", _cua_call(op), lambda: result,
+                         lambda: None)
+
+    def test_offer_stable_id_and_ack(self):
+        self._succeed()
+        a = self.journal.offer("s1", "op1", "ui")
+        b = self.journal.offer("s1", "op1", "ui")
+        self.assertEqual(a["delivery_id"], b["delivery_id"])
+        self.assertEqual(a["status"], "succeeded")
+        self.assertEqual(a["result"], "RES")
+        # offer alone does not acknowledge
+        self.assertEqual(
+            len(self.journal.pending_deliveries("s1", "ui")), 1)
+        self.assertTrue(
+            self.journal.acknowledge("s1", "ui", a["delivery_id"]))
+        self.assertTrue(  # idempotent
+            self.journal.acknowledge("s1", "ui", a["delivery_id"]))
+        self.assertEqual(
+            self.journal.pending_deliveries("s1", "ui"), [])
+
+    def test_offer_survives_restart_same_id(self):
+        self._succeed()
+        first = self.journal.offer("s1", "op1", "ui")["delivery_id"]
+        self.journal.close()
+        self.journal = operations.OperationJournal(self.db)
+        again = self.journal.offer("s1", "op1", "ui")["delivery_id"]
+        self.assertEqual(first, again)
+
+    def test_offer_refuses_nonterminal(self):
+        # a crashed run leaves outcome_unknown — not offerable
+        def boom():
+            raise RuntimeError("crash")
+        with self.assertRaises(RuntimeError):
+            self.journal.run("s1", _cua_call("bad"), boom, lambda: None)
+        with self.assertRaises(IncompleteResponse):
+            self.journal.offer("s1", "bad", "ui")
+        with self.assertRaises(UnsupportedRequest):
+            self.journal.offer("s1", "missing", "ui")
+
+    def test_wrong_scope_consumer_ack_false(self):
+        self._succeed()
+        offer = self.journal.offer("s1", "op1", "ui")
+        self.assertFalse(self.journal.acknowledge(
+            "other", "ui", offer["delivery_id"]))
+        self.assertFalse(self.journal.acknowledge(
+            "s1", "other", offer["delivery_id"]))
+        self.assertFalse(self.journal.acknowledge(
+            "s1", "ui", "f" * 32))
+        self.assertEqual(
+            len(self.journal.pending_deliveries("s1", "ui")), 1)
+
+    def test_failed_result_offerable(self):
+        def boom():
+            raise RuntimeError("nope")
+        with self.assertRaises(RuntimeError):
+            self.journal.run("s1", _cua_call("f1"), boom, lambda: None)
+        # crashed -> outcome_unknown, not offerable
+        with self.assertRaises(IncompleteResponse):
+            self.journal.offer("s1", "f1", "ui")
+        # a failed persisted result is offerable: mark via finish
+        self.journal._finish("s1", "f1", "failed", "executor error")
+        offer = self.journal.offer("s1", "f1", "ui")
+        self.assertEqual(offer["status"], "failed")
+
+    def test_concurrent_offer_single_id(self):
+        import threading
+        self._succeed()
+        ids, errs = [], []
+        def offer():
+            try:
+                ids.append(
+                    self.journal.offer("s1", "op1", "ui")
+                    ["delivery_id"])
+            except Exception as e:
+                errs.append(e)
+        ts = [threading.Thread(target=offer) for _ in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertFalse(errs)
+        self.assertEqual(len(set(ids)), 1)
+
+    def test_concurrent_offer_two_instances(self):
+        import threading
+        self._succeed()
+        other = operations.OperationJournal(self.db)
+        self.addCleanup(other.close)
+        ids, errs = [], []
+        barrier = threading.Barrier(4)
+        def offer(j):
+            try:
+                barrier.wait(10)
+                ids.append(j.offer("s1", "op1", "ui")["delivery_id"])
+            except Exception as e:
+                errs.append(e)
+        ts = [threading.Thread(target=offer, args=(j,))
+              for j in (self.journal, other, self.journal, other)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(10)
+        self.assertFalse(errs)
+        self.assertEqual(len(set(ids)), 1)
+
+    def test_many_scopes_deliveries(self):
+        for i in range(70):
+            self.journal.run(f"sc{i}", _cua_call("c1"),
+                             lambda i=i: f"r{i}", lambda: None)
+            o = self.journal.offer(f"sc{i}", "c1", "ui")
+            self.assertEqual(o["result"], f"r{i}")
+
+
 if __name__ == "__main__":
     unittest.main()

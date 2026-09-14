@@ -218,6 +218,17 @@ class TranslateTest(unittest.TestCase):
             packet_to_responses_body(self._packet(user),
                                      parse_routed_model("x"), {})
 
+    def test_large_unknown_tool_result_field_reports_protocol_gap(self) -> None:
+        out = (wire.field(2, 4) + wire.field(3, "synthetic tool result")
+               + wire.field(7, "c1") + wire.field(10, b"x" * 22588))
+        with self.assertRaises(UnsupportedRequest) as caught:
+            packet_to_responses_body(self._packet(out),
+                                     parse_routed_model("x"), {})
+        self.assertEqual(
+            str(caught.exception),
+            "tool image field 10 invalid or unsupported "
+            "(PNG/JPEG required)")
+
     def test_small_unknown_field_ignored_not_dropped_silently(self) -> None:
         user = wire.field(2, 1) + wire.field(3, "hi") + wire.field(8, b"msgid")
         rec: dict = {}

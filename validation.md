@@ -1,5 +1,278 @@
 # Validation — remediation gate
 
+## Post-patch image-result verification (2026-09-14)
+
+This section supersedes the older test counts, PNG-only description, and
+installed-service status below. The earlier recovery notes and remediation
+matrix remain historical, not claims of current live-provider qualification.
+The tested tree is HEAD `d42d4c4bb68bedd000b1a7864c56914922af038b` plus the
+existing uncommitted changes and untracked modules/fixtures. Those changes
+were preserved; this verification added integration coverage, extended the
+large-image regression, and updated this document. No commit or push was made.
+
+### Complete post-patch gate
+
+Commands, run from `/Users/mappu/projects/fusion-codex-relay` with the installed
+service's interpreter:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -p 'test_privacy_transport.py' -v
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -v
+git diff --check
+```
+
+- Scoped transport/integration run: **71 tests, OK, exit 0**.
+- Complete suite after the image patch and new integration tests:
+  **398 tests, OK, exit 0; no failures, errors, or skips**. JPEG tests ran,
+  rather than being skipped for a missing decoder.
+- `git diff --check`: **exit 0**, no whitespace errors.
+- Evidence: `/tmp/devin-toolimg-verify2/test_privacy_transport.txt` and
+  `/tmp/devin-toolimg-verify2/full-suite.txt` (complete output and exit codes).
+- The full run emitted non-failing `ResourceWarning`s for unclosed subprocess
+  files during runtime tests, including `test_bad_init_and_tools_rejected`
+  and `test_cancel_during_consent_kills_child`. The earlier pre-image-repair
+  log `/tmp/relay-testgate-1789368495/unittest.log` already contains unclosed
+  file warnings during `test_bad_init_and_tools_rejected`. Thus this warning
+  class predates the repair; every individual warning has not been separately
+  attributed. There are no test failures to classify as pre-existing versus
+  regressions. No clean-HEAD comparison is claimed: HEAD alone omits substantial
+  pre-existing working-tree work and would not be an equivalent baseline.
+
+### Isolated captured-CLI integration
+
+`ServerFixtureTest.test_captured_tool_image_downstream_serialization` in
+`tests/test_privacy_transport.py` reuses the previously captured CLI 3000.10.21
+synthetic PNG-read message, `tests/fixtures/tool-image-message.bin`, verbatim.
+The companion PNG is `tests/fixtures/tool-image.png`. Historical capture
+metadata remains at `/tmp/relay-imgcap-1789369378/tool-result-meta.json`.
+This verification reuses that capture; it does not claim a newly launched CLI
+session or capture of the original failing conversation.
+
+The test wraps the captured message with a synthetic matching assistant tool
+call and session/model fields, sends a Connect-framed request over real
+loopback HTTP to an isolated relay handler, and runs the real wire decoding,
+translation, tool-call wrapper, and `urllib.request.Request` JSON serialization.
+Only the downstream `urlopen` boundary is mocked, returning synthetic SSE;
+authentication, storage, and route state are isolated with fake credentials
+and temporary directories. No request reaches the private provider endpoint.
+Both `buffer` and `delta` modes pass, including a successful Connect trailer.
+
+Assertions verify the actual serialized downstream body preserves:
+
+- PNG bytes exactly, checked by strict base64 decoding against the fixture;
+- MIME type `image/png` in the `data:image/png;base64,...` input-image part;
+- accompanying text `[Image 1]` as an `input_text` part;
+- tool-call ID `synthetic-call-1` on both call and `function_call_output`;
+- upstream model `gpt-6-astra` and reasoning `{"effort": "high"}`.
+
+The captured downstream JSON is retained at
+`/tmp/devin-toolimg-verify2/downstream-request-body.json`. Its temporary capture
+runner and output are `/tmp/devin-toolimg-verify2/capture_runner.py` and
+`/tmp/devin-toolimg-verify2/capture-runner.txt`. The durable test does not write
+request artifacts. These are synthetic evidence files, not production logs.
+
+`test_invalid_tool_images_never_reach_downstream` additionally verifies that
+malformed protobuf, unsupported `image/svg+xml`, and an envelope exceeding a
+patched-down byte limit return `invalid_argument` without calling `urlopen`.
+Existing unit rejection tests remain intact for invalid base64, duplicate or
+missing fields, MIME/content mismatch, malformed image bytes, excessive image
+count, absent call ID, unknown fields, and size/dimension/decompression bounds.
+The large-image preservation regression now covers envelopes larger than
+both 22,588 and 59,107 bytes; these synthetic values are not the original
+failure payloads. The integration oversize case uses a reduced limit to test
+the guard, not an actual production-limit-sized upload.
+
+Current translation accepts the strict field-10 base64/MIME envelope for
+PNG and JPEG, at most four images per tool result and 8 MiB decoded image
+bytes per image, with image validators enforcing their additional bounds.
+PNG remains limited to the native validator's subset; JPEG validation uses
+Pillow (`requirements-image.txt` pins `Pillow==11.3.0`). Valid JPEG bytes
+labelled `image/png` are identified as JPEG and serialized as `image/jpeg`;
+PNG labelled JPEG is rejected. This is the existing implementation tested
+here, not a newly broadened acceptance policy.
+
+### Installed relay versus working tree
+
+Read-only inspection of the launchd job and listener established:
+
+- LaunchAgent: `gui/501/ai.maapu.fusion-relay`, configured by
+  `/Users/mappu/Library/LaunchAgents/ai.maapu.fusion-relay.plist`.
+- Command: `/usr/bin/python3 -m fusion_relay.relay 8931`. The running executable
+  resolves to the Xcode Python framework's Python 3.9 process.
+- Both `WorkingDirectory` and `PYTHONPATH` point to
+  `/Users/mappu/projects/fusion-codex-relay`; it runs this source tree directly,
+  not an installed wheel or separate build output.
+- After the explicitly approved restart, PID **92406** started at
+  **2026-09-14 09:53:12 local time**, with the expected cwd and listener
+  `127.0.0.1:8931`. `/healthz` returned `{"ok": true}`. Restart evidence:
+  `/tmp/devin-toolimg-verify/restart-output.txt`.
+- The translator/image-validator edits predate that process start
+  (`translate.py` 00:21:13, `images.py` 00:26:26, `artifacts.py` on Sep 13).
+  The old PID 98989 had started on Sep 13 before these fixes. The new process
+  loads the current source at startup; this is launch/source provenance,
+  not introspection of the old process's imported bytecode.
+
+**No build or install step is needed on this machine**, and no additional
+restart was performed for this follow-up: only tests and documentation changed.
+The prior restart was approved after warning about interrupted traffic,
+cleared in-memory caches, and loading all existing local changes, including
+disabled relay-owned computer dispatch. Future source changes require a
+restart to affect already imported modules. Deployment elsewhere must include
+the untracked `artifacts.py`, `images.py`, required local dependencies, and
+fixtures/tests as appropriate; the Git commit alone does not contain this repair.
+No dependencies or global configuration were changed during verification.
+
+### Fusion model selection: configuration versus observations
+
+Read-only inspection of `/Users/mappu/.config/devin/config.json` found both
+`agent.model` and `agent.preferred_family_models.fusion` set to exactly:
+
+```text
+fusion-gpt-6-astra-high-sidekick-swe-2-medium
+```
+
+This config selects an Astra lead at **High** and SWE-2 sidekick at **Medium**.
+The separate `preferred_family_models.swe-2 = swe-2-max` value is a standalone
+family preference, not the sidekick segment of the configured Fusion selector.
+`bin/devin-fusion` sets the relay endpoint and passes CLI arguments unchanged;
+it does not select or raise reasoning effort. CLI documentation also supports
+`--model`/`DEVIN_MODEL`, `/model`, and session thinking-level changes. The
+inspected CLI processes had no `--model` argument, and `DEVIN_MODEL` was unset
+in the verification shell; this does not establish every session's overrides.
+
+At the relay boundary, model routing uses GetChatMessage field 21, with
+persisted session route pins also able to select native forwarding. The
+isolated integration supplies `gpt-6-astra-high` and proves the downstream
+serialization is `gpt-6-astra` with `reasoning.effort = high`. The translator
+maps `-max` to `xhigh` but does not map `-high` to `xhigh`. SWE requests are
+forwarded unchanged under the installed default auxiliary policy; the relay
+does not impose a separate Codex reasoning value on the sidekick.
+
+The current chat's supplied runtime label says **GPT-6 Astra High Thinking +
+SWE-2 Medium**. That label is an observation distinct from the config and from
+a captured provider request; the exact selector and effective settings of the
+interrupted conversation have not been extracted or replayed. Sanitized relay
+records omit raw model and effort fields and mark role provenance unverified,
+so they cannot supply session-specific proof of lead/sidekick settings here.
+No High-to-XHigh change, model reassignment, or settings write was performed.
+
+### Separately approved live synthetic check
+
+After the isolated gate, the user's explicit approval for a synthetic live
+image check was exercised with **exactly one** POST through the installed
+relay on port 8931. No additional restart was needed. A fresh synthetic
+session ID, the captured PNG tool-result message, a synthetic matching prior
+tool call, and a request to describe the image were used. Field 21 was
+`gpt-6-astra-high`; no tool definitions were offered and no tools were executed.
+Only the existing local relay access token was read for authentication; no
+token, token-bearing URL, request headers, or provider credentials were
+printed or persisted in the evidence.
+
+Observed result: **HTTP 200**, a clean Connect end trailer (`{}`), and **zero
+tool calls**. The actual response was:
+
+> The image has tightly packed, repeating diagonal rainbow stripes running
+> from bottom left to top right. Bright green, yellow, pink, red, cyan, and
+> blue bands create a vivid, slightly pixelated pattern.
+
+Direct visual inspection of `tests/fixtures/tool-image.png` confirms the
+fixture contains diagonal rainbow stripes consistent with that description.
+This establishes successful live acceptance and an image-consistent response
+for this synthetic fixture through the installed relay, not general visual
+accuracy or recovery of the interrupted conversation. The live request's
+routed identifier is observed; the downstream model/effort serialization is
+proven separately by the isolated capture and translator, not by logging live
+provider request bodies.
+
+Evidence: `/tmp/devin-toolimg-live/live_check.py` (one-shot runner),
+`/tmp/devin-toolimg-live/result.json` (sanitized result),
+`/tmp/devin-toolimg-live/response.bin` (synthetic response only), and
+`/tmp/devin-toolimg-live/stdout.txt` (output and exit 0). The full suite was not
+rerun after this check because no implementation or test files changed.
+
+### Remaining qualification boundary
+
+The captured synthetic PNG failed on the pre-fix translator with a 2,002-byte
+field-10 rejection (historical evidence:
+`/tmp/toolimg-prefix-1789369807/prefix.log`) and now passes local integration.
+The original **59,107-byte** failure has not been captured, reproduced, or
+replayed against the repaired version. Its content cannot be identified from
+its size alone, and **the original protocol error is not claimed resolved**.
+
+No original conversation replay or desktop action was performed. The full
+suite and isolated integration used fake upstreams; the separately approved
+one-request synthetic live check above is the only live-provider inference
+performed for this verification. Neither synthetic check identifies or
+reproduces the original 59,107-byte payload. Historical computer/runtime
+qualification limitations below are not cleared by these tests.
+
+## Interrupted-session recovery check (2026-09-13)
+
+At HEAD `d42d4c4`, with the existing uncommitted approval, artifact,
+broker, lease, runtime, and journal-delivery work preserved, the command
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v`
+completed with **366 tests, OK (exit 0)**. Evidence:
+`/tmp/relay-testgate-1789368495/unittest.log`. `git diff --check` was clean.
+This check used local tests, including fake runtime children and loopback
+servers; it did not restart installed services, access real credentials,
+run live inference, or perform desktop actions.
+
+The initial synthetic rejection test used 22,588 arbitrary bytes, not the
+original failing payload. After user approval, an isolated CLI 3000.10.21
+session with fresh HOME/XDG directories, fake credentials, a loopback-only
+mock inference server, and a network-restricted child captured real client
+encoding without live inference or desktop actions. A plain-text read had
+no field 10; a synthetic PNG read produced source-4 field 10 containing
+nested protobuf field 1 (base64 PNG) and field 2 (`image/png`). Decoded image
+bytes exactly matched the fixture. Evidence:
+`/tmp/relay-capture-1789368837/tool-result-meta.json` and
+`/tmp/relay-imgcap-1789369378/tool-result-meta.json`.
+
+The PNG capture is retained as `tests/fixtures/tool-image-message.bin` and
+`tests/fixtures/tool-image.png`. Its regression failed before the fix with
+`message field 10 (source 4) carries a 2002-byte payload the translator
+cannot represent`: `/tmp/toolimg-prefix-1789369807/prefix.log`.
+The original 22,588-byte request was not captured; the PNG read establishes
+one confirmed path to the same error, not the identity of that old payload.
+
+`translate.py` now decodes that verified tool-result envelope, validates
+PNG content using the existing `artifacts.validate_png`, and emits typed
+`input_text`/`input_image` parts inside `function_call_output.output`,
+preserving the call ID and actual image bytes. This format is specified by
+https://developers.openai.com/api/docs/guides/function-calling and the local
+Codex app-server schema captured at
+`/tmp/fusion-relay-protocol-discovery-20260914/v2/ThreadResumeParams.json`
+(`FunctionCallOutputBody` and `FunctionCallOutputContentItem`). The private
+live inference endpoint has not been qualified by this check.
+
+Supported envelope: exactly one base64 field and one `image/png` MIME field,
+at most four images per tool-result message, at most 8 MiB decoded per image,
+and the validator's noninterlaced 8-bit RGB/RGBA PNG subset (dimension,
+pixel-count, CRC, and decompression bounds enforced). Other MIME types,
+malformed envelopes, and unknown consequential fields remain rejected.
+This path uses inline bytes, does not open model-supplied paths, and does not
+create artifact-store records or enable computer dispatch. Deployment must
+include the existing untracked `fusion_relay/artifacts.py` dependency.
+
+After the translator change, scoped checks passed: **11 image tests** and
+**66 relay tests**. Commands:
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_tool_images.py' -v`
+and
+`PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_relay.py' -v`.
+Evidence: `/tmp/toolimg-postfix-1789369830/toolimg.log` and
+`/tmp/toolimg-postfix-1789369830/relay.log`.
+The full 366-test result above predates this translator repair; it was not
+rerun afterward. No installed service was restarted, no global defaults or
+canonical credentials changed, and no commit or push was made. To roll back
+this repair, reverse only the new image-translation hunk and its new tests;
+preserve all preexisting remediation work, route state, and evidence.
+Final targeted rerun: `/tmp/toolimg-final-1789369963/toolimg.log`.
+
+The earlier gate and R01–R11 table below are historical evidence for the
+previous remediation diff, not an updated assessment of the unfinished
+local modules. Passing this recovery gate does not qualify native
+Fusion role enforcement, live consent, visual feedback, or full recovery.
+
 **Scope of this gate.** Everything below was verified only on the local
 remediation diff (base `60224b1`, all changes uncommitted) using unit
 tests plus real loopback HTTP sockets bound to `127.0.0.1` with faked

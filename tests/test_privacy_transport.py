@@ -768,6 +768,99 @@ class ServerFixtureTest(unittest.TestCase):
                                      b"", token="wrong-token-00000000")
         self.assertEqual(status, 403)
 
+    def _tool_image_chat(self, message):
+        call = (wire.field(1, "synthetic-call-1") + wire.field(2, "read")
+                + wire.field(3, '{"file_path":"synthetic.png"}'))
+        assistant = wire.field(2, 2) + wire.field(6, call)
+        packet = (wire.field(3, assistant) + wire.field(3, message)
+                  + wire.field(16, "synthetic-image-integration")
+                  + wire.field(21, "gpt-6-astra-high"))
+        return wire.frame(packet) + wire.end_stream()
+
+    def test_captured_tool_image_downstream_serialization(self):
+        self.addCleanup(translate.reset)
+        fixtures = pathlib.Path(__file__).parent / "fixtures"
+        message = (fixtures / "tool-image-message.bin").read_bytes()
+        png = (fixtures / "tool-image.png").read_bytes()
+        event = {"type": "response.completed", "response": {
+            "id": "synthetic-image-response", "status": "completed",
+            "output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}}
+        captured = []
+
+        def upstream(request, timeout):
+            self.assertEqual(request.full_url, translate.CODEX_RESPONSES_URL)
+            self.assertEqual(request.get_header("Content-type"),
+                             "application/json")
+            captured.append(json.loads(request.data))
+            response = io.BytesIO(("data: " + json.dumps(event) + "\n\n").encode())
+            response.status = 200
+            response.headers = {}
+            return response
+
+        for mode in ("buffer", "delta"):
+            with self.subTest(mode=mode):
+                translate.reset()
+                with patch.object(relay, "STREAM_MODE", mode), \
+                        patch.object(translate.urllib.request, "urlopen",
+                                     side_effect=upstream) as send:
+                    status, data, ctype = self._post(
+                        f"{self.RPC_BASE}/GetChatMessage",
+                        self._tool_image_chat(message),
+                        ctype="application/connect+proto")
+                self.assertEqual(status, 200)
+                self.assertEqual(ctype, "application/connect+proto")
+                send.assert_called_once()
+                frames = list(wire.iter_frames(data))
+                self.assertEqual(frames[-1][0], 2)
+                self.assertNotIn("error", json.loads(frames[-1][1]))
+                self.assertEqual(wire.text(wire.decode(frames[0][1]), 1),
+                                 "synthetic-image-response")
+                body = captured[-1]
+                self.assertEqual(body["model"], "gpt-6-astra")
+                self.assertEqual(body["reasoning"], {"effort": "high"})
+                call, result = body["input"]
+                self.assertEqual(call["type"], "function_call")
+                self.assertEqual(call["call_id"], "synthetic-call-1")
+                self.assertEqual(result["type"], "function_call_output")
+                self.assertEqual(result["call_id"], call["call_id"])
+                self.assertEqual(result["output"], [
+                    {"type": "input_text", "text": "[Image 1]"},
+                    {"type": "input_image", "image_url":
+                     "data:image/png;base64," + base64.b64encode(png).decode()}])
+                image_url = result["output"][1]["image_url"]
+                self.assertEqual(base64.b64decode(image_url.split(",", 1)[1],
+                                                 validate=True), png)
+        translate.reset()
+
+    def test_invalid_tool_images_never_reach_downstream(self):
+        from fusion_relay import artifacts
+        png = (pathlib.Path(__file__).parent / "fixtures" / "tool-image.png").read_bytes()
+        encoded = base64.b64encode(png)
+        valid = wire.field(1, encoded) + wire.field(2, "image/png")
+        cases = (
+            ("malformed", b"\x0a\xff", artifacts.MAX_ARTIFACT_BYTES),
+            ("unsupported", wire.field(1, encoded) + wire.field(2, "image/svg+xml"),
+             artifacts.MAX_ARTIFACT_BYTES),
+            ("oversized", valid, 32),
+        )
+        for name, envelope, limit in cases:
+            with self.subTest(case=name):
+                message = (wire.field(2, 4) + wire.field(3, "[Image 1]")
+                           + wire.field(7, "synthetic-call-1")
+                           + wire.field(10, envelope))
+                with patch.object(artifacts, "MAX_ARTIFACT_BYTES", limit), \
+                        patch.object(translate.urllib.request, "urlopen") as send:
+                    status, data, _ = self._post(
+                        f"{self.RPC_BASE}/GetChatMessage",
+                        self._tool_image_chat(message),
+                        ctype="application/connect+proto")
+                self.assertEqual(status, 200)
+                frames = list(wire.iter_frames(data))
+                self.assertEqual(frames[-1][0], 2)
+                self.assertEqual(json.loads(frames[-1][1])["error"]["code"],
+                                 "invalid_argument")
+                send.assert_not_called()
+
     def test_codex_inference_buffered(self):
         tail = wire.frame(wire.field(1, "r1")
                           + wire.field(6, wire.field(3, "hello"))) \

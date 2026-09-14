@@ -23,6 +23,7 @@ import pathlib
 import sqlite3
 import stat as _stat
 import threading
+import uuid
 from typing import Callable, Optional
 
 from . import storage
@@ -36,7 +37,14 @@ CREATE TABLE IF NOT EXISTS operations(
     fingerprint TEXT NOT NULL,
     status TEXT NOT NULL,
     result TEXT,
-    PRIMARY KEY(scope, operation_id))
+    PRIMARY KEY(scope, operation_id));
+CREATE TABLE IF NOT EXISTS delivery(
+    scope TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    consumer TEXT NOT NULL,
+    delivery_id TEXT NOT NULL UNIQUE,
+    acknowledged INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(scope, operation_id, consumer))
 """
 
 _TERMINAL = ("succeeded", "failed", "cancelled")
@@ -62,7 +70,10 @@ class OperationJournal:
         self._db.execute("PRAGMA busy_timeout=1000")
         self._db.execute("PRAGMA journal_mode=DELETE")
         self._db.execute("PRAGMA synchronous=FULL")
-        self._db.execute(_SCHEMA)
+        for stmt in _SCHEMA.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                self._db.execute(stmt)
         self._lock = threading.RLock()
 
     def close(self) -> None:
@@ -180,3 +191,100 @@ class OperationJournal:
                 "outcome_unknown: explicit reconciliation required")
         self._finish(scope, cid, "succeeded", result)
         return result
+
+    # -- durable result delivery --------------------------------------
+    #
+    # The delivery table records per-consumer handoff of terminal
+    # results. ``consumer`` is an arbitrary caller-supplied label — it is
+    # not a trusted identity. Offering is not acknowledgement: a result
+    # stays pending until ``acknowledge`` is called.
+
+    @staticmethod
+    def _check_delivery_args(scope: str, consumer: str) -> None:
+        from . import translate
+        for v, name in ((scope, "scope"), (consumer, "consumer")):
+            if not isinstance(v, str) or not v or len(v) > 512:
+                raise translate.UnsupportedRequest(
+                    f"delivery {name} required")
+
+    def offer(self, scope: str, operation_id: str,
+              consumer: str) -> dict:
+        """Offer a terminal result to a consumer with a stable id.
+
+        Only persisted ``succeeded``/``failed``/``cancelled`` results can
+        be offered; ``executing``/unknown outcomes refuse. The random
+        delivery id is created once per (scope, operation, consumer) and
+        reused across retries.
+        """
+        from . import translate
+        self._check_delivery_args(scope, consumer)
+        if not isinstance(operation_id, str) or not operation_id \
+                or len(operation_id) > 512:
+            raise translate.UnsupportedRequest("operation_id required")
+        with self._lock:
+            committed = False
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._fetch(scope, operation_id)
+                if row is None:
+                    raise translate.UnsupportedRequest(
+                        "unknown operation")
+                if row["status"] not in _TERMINAL:
+                    raise translate.IncompleteResponse(
+                        "outcome_unknown: explicit reconciliation "
+                        "required")
+                existing = self._db.execute(
+                    "SELECT delivery_id FROM delivery WHERE scope=? "
+                    "AND operation_id=? AND consumer=?",
+                    (scope, operation_id, consumer)).fetchone()
+                delivery_id = existing[0] if existing \
+                    else uuid.uuid4().hex
+                if existing is None:
+                    self._db.execute(
+                        "INSERT INTO delivery"
+                        "(scope, operation_id, consumer, delivery_id) "
+                        "VALUES(?,?,?,?)",
+                        (scope, operation_id, consumer, delivery_id))
+                self._db.execute("COMMIT")
+                committed = True
+            except BaseException:
+                if not committed:
+                    try:
+                        self._db.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                raise
+        return {"delivery_id": delivery_id,
+                "operation_id": operation_id,
+                "status": row["status"], "result": row["result"]}
+
+    def acknowledge(self, scope: str, consumer: str,
+                    delivery_id: str) -> bool:
+        """Mark a delivery acknowledged; idempotent True after ack."""
+        self._check_delivery_args(scope, consumer)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT acknowledged FROM delivery WHERE scope=? "
+                "AND consumer=? AND delivery_id=?",
+                (scope, consumer, delivery_id)).fetchone()
+            if row is None:
+                return False
+            if not row[0]:
+                self._db.execute(
+                    "UPDATE delivery SET acknowledged=1 WHERE scope=? "
+                    "AND consumer=? AND delivery_id=?",
+                    (scope, consumer, delivery_id))
+            return True
+
+    def pending_deliveries(self, scope: str, consumer: str) -> list:
+        """Unacknowledged deliveries for one scoped consumer."""
+        self._check_delivery_args(scope, consumer)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT d.operation_id, d.delivery_id, o.status, "
+                "o.result FROM delivery d JOIN operations o "
+                "ON o.scope=d.scope AND o.operation_id=d.operation_id "
+                "WHERE d.scope=? AND d.consumer=? AND d.acknowledged=0",
+                (scope, consumer)).fetchall()
+        return [{"operation_id": r[0], "delivery_id": r[1],
+                 "status": r[2], "result": r[3]} for r in rows]

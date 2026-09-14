@@ -216,6 +216,33 @@ def _stash_reasoning(cache_key: str, items: list[dict]) -> None:
             _reasoning_cache.pop(next(iter(_reasoning_cache)))
 
 
+def _tool_image_part(raw: bytes) -> dict:
+    from .artifacts import MAX_ARTIFACT_BYTES
+    from .images import checked_image
+    from .wire import decode_typed
+    error = 'tool image field 10 invalid or unsupported (PNG/JPEG required)'
+    try:
+        limit = 4 * ((MAX_ARTIFACT_BYTES + 2) // 3)
+        if not isinstance(raw, bytes) or len(raw) > limit + 64:
+            raise ValueError('envelope size')
+        image = decode_typed(raw)
+        if set(image) != {1, 2} or any(
+                len(values) != 1 or values[0][1] != 2
+                for values in image.values()):
+            raise ValueError('envelope schema')
+        encoded, mime = image[1][0][0], image[2][0][0]
+        if mime not in (b'image/png', b'image/jpeg') or not encoded \
+                or len(encoded) > limit:
+            raise ValueError('encoding')
+        data = base64.b64decode(encoded, validate=True)
+        actual_mime, _ = checked_image(data, mime.decode('ascii'))
+        return {'type': 'input_image',
+                'image_url': 'data:%s;base64,%s' % (
+                    actual_mime, base64.b64encode(data).decode('ascii'))}
+    except (ValueError, TypeError):
+        raise UnsupportedRequest(error) from None
+
+
 def packet_to_responses_body(packet: Message, routed: RoutedModel,
                              rec: dict,
                              continuity_scope: str = "") -> dict:
@@ -231,10 +258,15 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
         for num, values in msg.items():
             if num in KNOWN_MSG_FIELDS:
                 continue
+            if source == SRC_TOOL_OUT and num == 10:
+                if len(values) > 4:
+                    raise UnsupportedRequest('too many tool images')
+                images.extend(_tool_image_part(val) for val in values)
+                continue
             for val in values:
                 if isinstance(val, bytes):
                     mime = _image_mime(val)
-                    if mime:
+                    if mime and source != SRC_TOOL_OUT:
                         images.append({
                             "type": "input_image",
                             "image_url": "data:%s;base64,%s" % (
@@ -269,10 +301,14 @@ def packet_to_responses_body(packet: Message, routed: RoutedModel,
             instructions.append(body_text)
             continue
         if source == SRC_TOOL_OUT:
+            if images and not text(msg, 7):
+                raise UnsupportedRequest('tool image call_id required')
+            output = body_text
             if images:
-                raise UnsupportedRequest("tool-output images not translatable")
-            inputs.append({"type": "function_call_output",
-                           "call_id": text(msg, 7), "output": body_text})
+                output = ([{'type': 'input_text', 'text': body_text}]
+                          if body_text else []) + images
+            inputs.append({'type': 'function_call_output',
+                           'call_id': text(msg, 7), 'output': output})
             continue
         if source not in (SRC_USER, SRC_ASSISTANT):
             raise UnsupportedRequest(f"message source {source} not supported")
