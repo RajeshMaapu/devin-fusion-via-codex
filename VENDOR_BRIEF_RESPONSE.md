@@ -38,7 +38,7 @@ server-owned catalog fields — we cannot add families, only relabel leaves.
 
 | Criterion | Status | Evidence |
 |---|---|---|
-| Both-direction switching across repeated selections | Implemented | `AssignModel` rewrite strips `-native`; unsuffixed = codex default. Live-verified: pinned session forwarded natively, unpinned astra → codex |
+| Both-direction switching across repeated selections | Implemented+Tested | `AssignModel` rewrite strips `-native`; canonical family selectors now re-pin `codex` explicitly — a stale `native` pin cannot survive a Codex-sub pick (gap found + fixed, unit-tested) |
 | Restart/resume preserves provider+model | Implemented+Tested | Pins persist to `routes.json`; verified live: seeded pin → launchd restart → next `GetChatMessage` for that session routed `cognition-forward` + `session_route: native` |
 | Concurrent sessions independent | Implemented | Pins keyed by session uuid (AssignModel f3 ≡ GetChatMessage f16) |
 | Failed assignment can't create disagreement | Implemented+Tested | Pin commits only when upstream `<400`; verified: synthetic `…-native` assign → upstream 415 → `pin_deferred` logged, no pin written |

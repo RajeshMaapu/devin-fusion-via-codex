@@ -153,3 +153,9 @@ client-side (session store, sidekick orchestration, tool harness), so the
 delta is confined to the translation layer: prompt layout, tool-schema
 conversion, reasoning-item continuity. Run your real workload on both paths
 before treating the routed path as a drop-in replacement.
+
+## License
+
+[MIT](LICENSE) — free to use, modify, and distribute, including commercially,
+with the copyright and license notice retained. Provider subscriptions and
+service terms still apply.
