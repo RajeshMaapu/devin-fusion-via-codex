@@ -46,7 +46,13 @@ The TUI model picker may show only `Fusion`, without the full lead model or `Cod
 
 > Note: Codex's computer-use skill has integration issues and is currently disabled in the relay.
 
+## Why these changes were necessary
+
+Switching Fusion’s Astra lead to a Codex subscription changes more than billing: Fusion and Codex use different request, response, and session contracts. The relay needs translation for tool calls, images, streaming, errors, and reasoning continuity while preserving Fusion’s orchestration and native SWE-2 sidekick. Recovery safeguards and validation help detect lost context, duplicate actions, and silent failures; they do not establish native benchmark parity.
+
+The changes are extensive because the Fusion harness itself was kept intact: nothing in the CLI, the Fusion lead/sidekick orchestration, or the native SWE-2 route is modified or replaced. Every gap between the two contracts is absorbed on the relay side instead — payload budgets, response reassembly, an encrypted continuation ledger with explicit recovery states, host bindings, and the two optional native hooks (`bin/fusion-prompt-marker`, `bin/fusion-post-compaction`) that use only documented CLI extension points. See `NATIVE_HOST_CONTRACT.md` for what the native client does and does not expose, `QUALIFICATION_RESULTS.md` for the measured evidence, and `DURABLE_RECOVERY_RUNBOOK.md` for operations.
+
 ## Notes
 
-- If a relay from before this update is still running, it runs the old code. The launcher verifies the service's code fingerprint, so a stale pre-handshake relay cannot be silently reused — any restart should be reviewed first. See `validation.md` for the current qualification status.
-- Durable session continuation is not enabled automatically: it requires a host application to attach a trusted binding, and the native acknowledgment contract is not yet qualified. The default path remains in-memory and unqualified.
+- If a relay from before this update is still running, it runs the old code. The launcher verifies the service's code fingerprint, so a stale pre-handshake relay cannot be silently reused — any restart should be reviewed first. See `validation.md` and `QUALIFICATION_RESULTS.md` for the current qualification status.
+- Durable session continuation is not enabled automatically: it requires a host application to attach a trusted binding, and the native acknowledgment contract is not yet qualified. The default path remains in-memory and unqualified. `bin/fusion-experimental-host` provides an explicitly unqualified, launcher-provenance durable mode for evaluation.
