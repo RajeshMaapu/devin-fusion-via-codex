@@ -52,6 +52,15 @@ Switching Fusion’s Astra lead to a Codex subscription changes more than billin
 
 The changes are extensive because the Fusion harness itself was kept intact: nothing in the CLI, the Fusion lead/sidekick orchestration, or the native SWE-2 route is modified or replaced. Every gap between the two contracts is absorbed on the relay side instead — payload budgets, response reassembly, an encrypted continuation ledger with explicit recovery states, host bindings, and the two optional native hooks (`bin/fusion-prompt-marker`, `bin/fusion-post-compaction`) that use only documented CLI extension points. See `NATIVE_HOST_CONTRACT.md` for what the native client does and does not expose, `QUALIFICATION_RESULTS.md` for the measured evidence, and `DURABLE_RECOVERY_RUNBOOK.md` for operations.
 
+### Scope
+
+This is the only scope available right now. The right scope now is to keep Fusion owning its harness and native SWE-2, minimize the lead adapter, and separately qualify computer use and enhanced recovery.
+
+- **Fusion owns the harness and native SWE-2.** The relay never reimplements orchestration; the sidekick stays on its native route.
+- **Minimal lead adapter.** The default path is the Astra → Codex translation only (legacy, in-memory continuity). This is what `bin/devin-fusion` runs.
+- **Computer use: separately qualified.** Codex computer dispatch remains disabled fail-closed (`computer_policy_denied`) until it has its own trusted dispatcher, consent UI, and qualification.
+- **Enhanced recovery: separately qualified.** Durable continuation, host bindings, epoch carry-over, and the experimental host are opt-in and labelled unqualified until the native lane-identity and acknowledgement contracts exist (`NATIVE_HOST_CONTRACT.md` §4).
+
 ## Notes
 
 - If a relay from before this update is still running, it runs the old code. The launcher verifies the service's code fingerprint, so a stale pre-handshake relay cannot be silently reused — any restart should be reviewed first. See `validation.md` and `QUALIFICATION_RESULTS.md` for the current qualification status.
