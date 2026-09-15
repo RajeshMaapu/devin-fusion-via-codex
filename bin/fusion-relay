@@ -5,54 +5,14 @@
 #   fusion-relay status         - show pid, health, routing stats
 #   fusion-relay fg [PORT]      - run in the foreground
 #   fusion-relay stats          - print routing/usage counters
+#   fusion-relay reconcile --acknowledge-unknown --evidence-ref <64hex>
+#                               - offline accounting reconciliation
+#                                 (refuses while a relay owns the store)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
-DATA_DIR="${FUSION_RELAY_DATA_DIR:-$HOME/.local/share/fusion-codex-relay}"
-PIDFILE="$DATA_DIR/relay.pid"
-LOG="$DATA_DIR/relay.log"
-PORT="${2:-${FUSION_RELAY_PORT:-8931}}"
 
-mkdir -p "$DATA_DIR"
-
-relay_pid() {  # echo pid if running, else nothing
-    [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && cat "$PIDFILE"
-}
-
-case "${1:-status}" in
-    start)
-        if pid="$(relay_pid)"; then
-            echo "already running (pid $pid)"; exit 0
-        fi
-        nohup python3 -m fusion_relay.relay "$PORT" >>"$LOG" 2>&1 &
-        echo $! >"$PIDFILE"
-        for _ in $(seq 1 30); do
-            curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1 && break
-            sleep 0.2
-        done
-        if curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null; then
-            echo "fusion-relay running on 127.0.0.1:$PORT (pid $(cat "$PIDFILE"))"
-        else
-            echo "failed to start; last log lines:"; tail -20 "$LOG"; exit 1
-        fi
-        ;;
-    stop)
-        if pid="$(relay_pid)"; then kill "$pid" && echo "stopped pid $pid"; else echo "not running"; fi
-        rm -f "$PIDFILE"
-        ;;
-    fg) exec python3 -m fusion_relay.relay "$PORT" ;;
-    stats)
-        TOKEN="$(cat "$DATA_DIR/relay-token" 2>/dev/null | tr -d '[:space:]')"
-        curl -sf "http://127.0.0.1:$PORT/t/$TOKEN/stats" || echo "relay not reachable on :$PORT" ;;
-    status)
-        if pid="$(relay_pid)"; then
-            echo "running (pid $pid, port $PORT)"
-            TOKEN="$(cat "$DATA_DIR/relay-token" 2>/dev/null | tr -d '[:space:]')"
-            curl -sf "http://127.0.0.1:$PORT/t/$TOKEN/stats" || true
-        else
-            echo "not running"
-        fi
-        ;;
-    *) echo "usage: fusion-relay {start [PORT]|stop|status|fg [PORT]|stats}"; exit 2 ;;
-esac
+# echo pid if running, else nothing — the Python manager verifies service
+# identity before any control action instead of trusting a pidfile.
+exec python3 -m fusion_relay.launcher "$@"

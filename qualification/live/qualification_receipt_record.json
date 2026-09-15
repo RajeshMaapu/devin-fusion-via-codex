@@ -1,0 +1,9 @@
+{
+  "build_identity": "d691f24e0bf71bfb685df6a99cff4773e21075938cfc713e5458e51ab18e4ada",
+  "levels": [
+    "local_tests",
+    "live_verified",
+    "benchmark_evaluated"
+  ],
+  "evidence_count": 10
+}

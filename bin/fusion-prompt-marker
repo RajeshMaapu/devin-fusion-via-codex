@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""UserPromptSubmit hook: inject an authenticated per-turn marker.
+
+Reads the hook JSON on stdin, takes ONLY ``session_id`` (the session
+name) and ``prompt_id``, and prints ``additionalContext`` containing
+``fusion-relay-marker v1 <session> <prompt> <hmac>`` keyed with the
+relay's identity key from the private data directory. The relay verifies
+the marker to correlate hook events (e.g. PostCompaction) with the wire
+session and to identify the turn. A hook must never block the CLI: this
+always exits 0 and prints nothing on any problem.
+"""
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+
+def main() -> int:
+    try:
+        from fusion_relay.identity import PrivateDirectory
+        from fusion_relay.launcher import DATA_DIR
+        from fusion_relay.marker import render
+
+        payload = json.loads(sys.stdin.read(1 << 16))
+        if not isinstance(payload, dict):
+            return 0
+        session = payload.get("session_id")
+        prompt = payload.get("prompt_id")
+        if not isinstance(session, str) or not isinstance(prompt, str):
+            return 0
+        with PrivateDirectory(DATA_DIR) as private:
+            secret = private.read("identity.key", 64)
+        text = render(secret, session, prompt)
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text}}))
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

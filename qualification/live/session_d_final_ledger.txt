@@ -1,0 +1,2 @@
+d epochs [('history_divergence', 0), ('history_compaction', 0), ('legacy_history', 1), ('legacy_history', 0), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1), ('legacy_history', 1)] states [('history_evidenced', 38), ('offered', 29)] ops [('cancel_unconfirmed', 1), ('succeeded', 43)]
+open runs 0

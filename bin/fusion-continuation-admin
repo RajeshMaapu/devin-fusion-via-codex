@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Operator reconciliation for unresolved continuation operations."""
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from fusion_relay.continuation_admin import main
+
+if __name__ == "__main__":
+    sys.exit(main())

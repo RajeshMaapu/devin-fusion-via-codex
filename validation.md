@@ -396,3 +396,81 @@ This diff is code-only: review/revert the uncommitted changes before any
 deployment. No destructive git operations were used, none should be. If a
 relay is already running, it keeps running old code until deliberately
 restarted.
+
+## 2026-09-14 repair implementation (working tree based on f310fc7)
+
+Implemented in the working tree (uncommitted): bounded and indexed
+refusal/terminal response handling; bounded runtime-handle cleanup with
+unconfirmed-termination reporting; redirect-blocked upstream transport;
+HMAC service identity with dirfd-pinned private storage and a Python
+launcher/manager (no shell PID signaling or auto-spawn trust); native
+Connect streaming for non-Astra Cognition routes (raw bytes, chunked
+downstream framing, bounded cleanup); transactional durable accounting
+(SQLite receipts, at-least-once export, sticky degradation); host-only
+AES-GCM-sealed continuation ledger with Keychain adapter and durable
+mode that fails closed without a trusted binding; session diagnostics
+(hashed refs, whitelisted fields, bounded LRU).
+
+### Gate
+
+- Full suite BEFORE the final narrowly tested diagnostic/reconciliation
+  additions: **662 tests, OK, 41.039s** (`.scratch/final_full_suite.log`,
+  `-W error::ResourceWarning`, no warnings-as-errors tripped).
+- The final reconcile/diagnostics edits were covered by targeted runs
+  only (`.scratch/verify_test_*.log`); the full-suite number above does
+  not claim the post-edit tree was re-run end to end.
+- `git diff --check` clean; `bash -n` on launcher scripts clean.
+
+### Qualification NOT done
+
+- Authenticated native lane / ACK binding absent — durable continuation
+  is opt-in and requires an attached host coordinator; legacy default
+  remains memory-only and unqualified.
+- Keychain tests are mocked plus SDK-signature verified — no real
+  Keychain integration was exercised.
+- Global retention/compaction/model-switch epoch operator path is not
+  integrated.
+- Native transport: HTTP trailers unsupported (explicit failure);
+  gzip-encoded upstream bodies pass through with usage "unknown";
+  TLS/proxy env trust disabled (`trust_env=False`) explicitly.
+- Snapshot accounting: the service requires the ledger at startup; old
+  JSON stats are marked unverified and never mixed into durable totals.
+- Dirty runs require explicit offline reconciliation acknowledgment;
+  unknown receipts are preserved, never zeroed or deleted.
+- Discovery HMAC bootstrap does not authenticate each future Devin TCP
+  connection (TOCTOU limitation) — not complete origin pinning.
+- The old live relay (if running) is untouched. The new launcher refuses
+  to trust that pre-handshake service until an approved restart.
+- No real-provider, native-cycle, benchmark, or computer-dispatch
+  qualification was run; no parity is claimed.
+
+### Environment note
+
+The earlier httpx install into the user's Python upgraded `certifi` to
+2026.7.22 as a transitive dependency; the later requirements work was a
+dry-run only and changed nothing installed.
+
+## Reviewed restart — 2026-09-14
+
+The user-approved `launchctl kickstart -k` of the existing
+`gui/501/ai.maapu.fusion-relay` job was executed against the reviewed
+instance (old PID 92406, started 09:53:12). The service now runs the
+working tree based on `f310fc7` — `build_identity` fingerprint
+`8bc9e2dd221fce200572517c90e2adc5c234931663ccf635d14bfb6c4eff602a`.
+
+- New PID 75991, started 14:31:55, same interpreter/command/port.
+- `/healthz`: ok=true, accounting degraded=false, coverage=partial
+  (pre-existing receipts with missing token fields), export_degraded=
+  false, reconciliation_required=false.
+- Verified launcher path (`bin/fusion-relay status`) and
+  `ensure_service` both confirmed the new instance by HMAC identity —
+  no respawn, no fallback. `/capabilities`: continuation
+  `legacy_memory_only_unqualified`, `native_ack_contract` unavailable,
+  native transport streaming, computer dispatch still disabled.
+- Restart cleared the in-memory continuity caches only; persistent
+  state was preserved and no reconciliation was required or run.
+- No inference, provider, Keychain, or billing calls were made. This is
+  a service restart verification, not a live Fusion/inference
+  qualification — no parity claim.
+- Evidence: `.scratch/reviewed_restart.log`,
+  `.scratch/restart_preflight.log`, `.scratch/restart_verify.log`.

@@ -15,6 +15,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler
 from unittest.mock import patch
 
 from fusion_relay import auth, catalog, relay, storage, translate, wire
@@ -275,7 +276,7 @@ class CodexTransportTest(unittest.TestCase):
         fake = _FakeSSE([b"x" * (1 << 20 | 1) + b"\n"])
         with patch.object(translate.auth, "get_token",
                           return_value=("t", "acct")), \
-                patch("urllib.request.urlopen", return_value=fake):
+                patch.object(translate, "open_request", return_value=fake):
             self.assertRaises(RuntimeError,
                               translate.call_codex, {"input": []}, {})
 
@@ -289,7 +290,7 @@ class CodexTransportTest(unittest.TestCase):
         rec = {}
         with patch.object(translate.auth, "get_token",
                           side_effect=AssertionError), \
-                patch("urllib.request.urlopen",
+                patch.object(translate, "open_request",
                       side_effect=lambda *a, **k: calls.append(1)):
             self.assertRaises(ctx, translate.call_codex,
                               {"input": []}, rec, check_cancelled=check)
@@ -314,7 +315,7 @@ class CodexTransportTest(unittest.TestCase):
 
         with patch.object(translate.auth, "get_token",
                           return_value=("t", "acct")), \
-                patch("urllib.request.urlopen",
+                patch.object(translate, "open_request",
                       return_value=CancelAfterOne()):
             self.assertRaises(translate.RequestCancelled,
                               translate.call_codex, {"input": []}, rec,
@@ -337,16 +338,19 @@ class CodexTransportTest(unittest.TestCase):
         rec = {}
         with patch.object(translate.auth, "get_token",
                           return_value=("t", "acct")), \
-                patch("urllib.request.urlopen", return_value=fake):
+                patch.object(translate, "open_request", return_value=fake):
             translate.call_codex({"input": []}, rec)
         self.assertEqual(rec["codex_quota_snapshot"],
                          {"x-codex-primary-used-percent": 42.5,
                           "x-codex-secondary-window-minutes": 300.0})
 
-    def test_http_error_no_body_read(self):
+    def test_http_error_body_read_bounded_and_discarded(self):
+        reads = []
+
         class Guard(io.BytesIO):
             def read(self, *a):
-                raise AssertionError("error body must not be read")
+                reads.append(a)
+                return super().read(*a)
 
             def close(self):
                 pass
@@ -356,11 +360,15 @@ class CodexTransportTest(unittest.TestCase):
         rec = {}
         with patch.object(translate.auth, "get_token",
                           return_value=("t", "acct")), \
-                patch("urllib.request.urlopen", side_effect=err):
-            self.assertRaises(RuntimeError,
+                patch.object(translate, "open_request", side_effect=err):
+            self.assertRaises(translate.UpstreamRejected,
                               translate.call_codex, {"input": []}, rec)
+        # bounded classification read; content is never stored
+        self.assertEqual(reads, [(translate.MAX_ERROR_BODY_BYTES + 1,)])
         self.assertEqual(rec["codex_http_status"], 429)
         self.assertEqual(rec["codex_status"], "failed")
+        self.assertEqual(rec["rejection_origin"], "upstream_unknown")
+        self.assertNotIn("secrets", json.dumps(rec))
 
 
 class SafeRecordTest(unittest.TestCase):
@@ -801,7 +809,7 @@ class ServerFixtureTest(unittest.TestCase):
             with self.subTest(mode=mode):
                 translate.reset()
                 with patch.object(relay, "STREAM_MODE", mode), \
-                        patch.object(translate.urllib.request, "urlopen",
+                        patch.object(translate, "open_request",
                                      side_effect=upstream) as send:
                     status, data, ctype = self._post(
                         f"{self.RPC_BASE}/GetChatMessage",
@@ -849,7 +857,7 @@ class ServerFixtureTest(unittest.TestCase):
                            + wire.field(7, "synthetic-call-1")
                            + wire.field(10, envelope))
                 with patch.object(artifacts, "MAX_ARTIFACT_BYTES", limit), \
-                        patch.object(translate.urllib.request, "urlopen") as send:
+                        patch.object(translate, "open_request") as send:
                     status, data, _ = self._post(
                         f"{self.RPC_BASE}/GetChatMessage",
                         self._tool_image_chat(message),
@@ -879,15 +887,37 @@ class ServerFixtureTest(unittest.TestCase):
     def test_native_forward_passthrough(self):
         body = wire.frame(self._chat_body(model="swe-2-medium")) \
             + wire.end_stream()
-        echo = relay.ForwardResponse(
-            200, b"upstream-bytes", "application/connect+proto", {})
-        with patch.object(relay, "_forward", return_value=echo) as m:
+        received = []
+
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                received.append(self.rfile.read(length))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/proto")
+                self.send_header("Content-Length",
+                                 str(len(b"upstream-bytes")))
+                self.end_headers()
+                self.wfile.write(b"upstream-bytes")
+
+            def log_message(self, *a):
+                pass
+
+        upstream = _QuietServer(("127.0.0.1", 0), Upstream)
+        thread = threading.Thread(target=upstream.serve_forever,
+                                  kwargs={"poll_interval": 0.05})
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(upstream.server_close)
+        self.addCleanup(upstream.shutdown)
+        with patch.object(relay, "UPSTREAM",
+                          "http://127.0.0.1:%d" % upstream.server_address[1]):
             status, data, _ = self._post(
                 f"{self.RPC_BASE}/GetChatMessage", body,
                 ctype="application/connect+proto")
         self.assertEqual(status, 200)
         self.assertEqual(data, b"upstream-bytes")
-        self.assertEqual(m.call_args[0][0], body)
+        self.assertEqual(received, [body])
 
     def test_assign_success_commits(self):
         req = wire.field(2, "gpt-6-astra-high-native") \
@@ -927,7 +957,9 @@ class ServerFixtureTest(unittest.TestCase):
                                          req)
         self.assertIn(b"selection_unconfirmed", data)
         # The session stays pending — inference for it must not run.
-        with patch.object(relay, "call_codex_with_tools") as m:
+        # (Grace shortened: a genuinely stuck selection still fails closed.)
+        with patch.object(relay, "call_codex_with_tools") as m, \
+                patch.object(relay, "SELECTION_GRACE_S", 0.2):
             framed = wire.frame(
                 self._chat_body(session="u-assign-3")) + wire.end_stream()
             status, data, _ = self._post(
@@ -935,6 +967,26 @@ class ServerFixtureTest(unittest.TestCase):
                 ctype="application/connect+proto")
         self.assertIn(b"selection_unconfirmed", data)
         self.assertEqual(m.call_count, 0)
+
+    def test_in_flight_selection_settles_within_grace(self):
+        """AssignModel and the turn's first GetChatMessage overlap in the
+        live CLI; a selection that settles within the grace window must
+        not reject the inference."""
+        import threading
+        import time as _time
+        session = "u-assign-grace"
+        revision = catalog.begin_selection(session, "codex")
+
+        def settle():
+            _time.sleep(0.3)
+            catalog.finish_selection(session, revision, True)
+        threading.Thread(target=settle).start()
+        started = _time.monotonic()
+        with patch.object(relay, "SELECTION_GRACE_S", 2.0):
+            packet = wire.decode(self._chat_body(session=session))
+            pinned = relay._session_route_settled(packet)
+        self.assertEqual(pinned, "codex")
+        self.assertLess(_time.monotonic() - started, 1.5)
 
     def test_route_store_failure_blocks_forward(self):
         req = wire.field(2, "gpt-6-astra-high-native") \
@@ -974,9 +1026,27 @@ class ServeOwnershipTest(unittest.TestCase):
             yield
             order.append("owner-exit")
 
+        class FakePrivate:
+            def __init__(self, path, create=False):
+                order.append("private")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                order.append("private-close")
+
+        class FakeLedger:
+            def __init__(self, path):
+                order.append("accounting")
+
+            def close(self, clean=True):
+                order.append("accounting-close")
+
         class FakeServer:
             def __init__(self, addr, handler):
                 order.append("server")
+                self.server_address = addr
 
             def __enter__(self):
                 return self
@@ -989,6 +1059,7 @@ class ServeOwnershipTest(unittest.TestCase):
 
         return [
             patch.object(relay, "store_owner", owner),
+            patch.object(relay, "PrivateDirectory", FakePrivate),
             patch.object(relay, "relay_token",
                          lambda: order.append("token") or "t" * 20),
             patch.object(relay.catalog, "attach_store",
@@ -997,7 +1068,10 @@ class ServeOwnershipTest(unittest.TestCase):
                          lambda: order.append("stats")),
             patch.object(relay.auth, "get_token",
                          lambda: order.append("auth") or ("t", "a")),
+            patch.object(relay, "AccountingLedger", FakeLedger),
             patch.object(relay, "_BoundedServer", FakeServer),
+            patch.object(relay.ServiceIdentity, "create",
+                         lambda d, port: order.append("identity")),
         ]
 
     def test_owner_acquired_before_any_state_load(self):
@@ -1010,19 +1084,32 @@ class ServeOwnershipTest(unittest.TestCase):
         finally:
             for p in patches:
                 p.stop()
-        self.assertEqual(order, ["owner", "token", "load", "stats",
-                                 "auth", "server", "serve",
-                                 "server-close", "owner-exit"])
+        self.assertEqual(order, ["private", "owner", "token", "load",
+                                 "stats", "auth", "accounting", "server",
+                                 "identity", "serve", "server-close",
+                                 "accounting-close", "owner-exit",
+                                 "private-close"])
 
     def test_ownership_refusal_blocks_startup(self):
         called = []
+
+        class FakePrivate:
+            def __init__(self, *a, **k):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                pass
 
         @contextlib.contextmanager
         def owner(path):
             raise OSError("another relay process owns this data directory")
             yield
 
-        marks = [patch.object(relay, "store_owner", owner),
+        marks = [patch.object(relay, "PrivateDirectory", FakePrivate),
+                 patch.object(relay, "store_owner", owner),
                  patch.object(relay, "relay_token",
                               lambda: called.append("token")),
                  patch.object(relay.catalog, "attach_store",
@@ -1039,6 +1126,37 @@ class ServeOwnershipTest(unittest.TestCase):
             for p in marks:
                 p.stop()
         self.assertEqual(called, [])
+
+    def test_symlink_ancestor_refused_before_any_state(self):
+        called = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp).resolve()
+            real = root / "real"
+            real.mkdir()
+            real_mode = stat.S_IMODE(os.stat(real).st_mode)
+            (root / "link").symlink_to(real, target_is_directory=True)
+            marks = [
+                patch.object(relay, "DATA_DIR", root / "link" / "data"),
+                patch.object(relay, "store_owner",
+                             lambda p: called.append("owner") or
+                             contextlib.nullcontext()),
+                patch.object(relay, "relay_token",
+                             lambda: called.append("token")),
+                patch.object(relay.auth, "get_token",
+                             lambda: called.append("auth")),
+                patch.object(relay, "_BoundedServer",
+                             lambda *a: called.append("server"))]
+            for p in marks:
+                p.start()
+            try:
+                self.assertRaises(OSError, relay.serve, 0)
+            finally:
+                for p in marks:
+                    p.stop()
+            self.assertEqual(called, [])
+            self.assertFalse((real / ".owner.lock").exists())
+            self.assertEqual(stat.S_IMODE(os.stat(real).st_mode),
+                             real_mode)
 
 
 if __name__ == "__main__":

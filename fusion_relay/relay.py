@@ -26,6 +26,8 @@ logged by name only, never arguments; prompt content never enters the log.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -35,21 +37,36 @@ import pathlib
 import re
 import secrets
 import select
+import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import auth, catalog, cua
+from . import auth, catalog, cua, marker, payload_budget, \
+    qualification
+from .accounting import AccountingLedger, AccountingUnavailable, \
+    reference
 from .catalog import RouteStateError
+from .identity import PrivateDirectory, ServiceIdentity
 from .lifecycle import RequestCancelled, RequestContext
 from .storage import append_private, atomic_write, ensure_private_dir, \
     read_private, store_owner
-from .translate import (ClientGone, IncompleteResponse, UnsupportedRequest,
+from .receipts import events_for_record
+from .transport import RedirectBlocked, open_request
+from .continuation import ContinuationError, digest
+from .host_binding import BindingError, context_from_headers
+from . import diagnostics
+from .payload_budget import (BUDGET_POLICY_VERSION, BudgetExceeded,
+                             PayloadReport, connect_code_for)
+from .translate import (ClientGone, CUA_TOOL_NAME, IncompleteResponse,
+                        UnsupportedRequest, UpstreamRejected, call_codex,
                         call_codex_with_tools, packet_to_responses_body,
                         parse_routed_model)
 from .usage import add_to_totals, normalized_usage, token_count
@@ -67,6 +84,10 @@ AUX_POLICY = os.environ.get("FUSION_RELAY_AUX", "forward")  # forward|reject|cod
 INSPECT_REQUESTS = {s for s in os.environ.get(
     "FUSION_RELAY_INSPECT", "").split(",") if s}
 STREAM_MODE = os.environ.get("FUSION_RELAY_STREAM", "delta")  # delta|buffer
+# Durable continuation is opt-in: a host application must attach a
+# ContinuationCoordinator; without one durable mode fails closed.
+CONTINUATION_MODE = os.environ.get(
+    "FUSION_RELAY_CONTINUATION", "legacy")  # legacy|durable
 UPSTREAM_TIMEOUT = int(os.environ.get("FUSION_RELAY_UPSTREAM_TIMEOUT", "120"))
 DATA_DIR = pathlib.Path(os.environ.get(
     "FUSION_RELAY_DATA_DIR", pathlib.Path.home() / ".local" / "share" / "fusion-codex-relay"))
@@ -84,6 +105,73 @@ MODEL_ID_RE = re.compile(rb"[a-z0-9.+-]*(?:astra|swe|sol|luna|fusion|devstral|ki
 _stats_lock = threading.Lock()
 _stats: dict = {"started": 0, "requests": 0, "by_route": {},
                 "tokens": {"codex": {}, "cognition": {}}}
+
+_accounting = None
+_accounting_required = False
+_accounting_export_degraded = False
+_accounting_lock = threading.RLock()
+
+# Attached only by the hosting application — never via HTTP or a guessed
+# role binding. See fusion_relay.continuation_host.
+_continuation_coordinator = None
+
+
+def set_continuation_coordinator(coordinator):
+    global _continuation_coordinator
+    _continuation_coordinator = coordinator
+
+
+def accounting_status():
+    if _accounting is None:
+        return {'degraded': True, 'partial': True,
+                'coverage': 'unavailable', 'reconciliation_required': True}
+    snap = _accounting.snapshot()
+    snap['export_degraded'] = _accounting_export_degraded
+    snap['account_binding'] = {'codex': 'provider_account',
+                               'native': 'credential_fingerprint'}
+    return snap
+
+
+def _admit_accounting(rec, provider, account_ref):
+    if _accounting is None:
+        if _accounting_required:
+            raise AccountingUnavailable('accounting unavailable')
+        return
+    operation_id = reference(provider, account_ref,
+                             secrets.token_hex(32))
+    _accounting.admit(operation_id, provider, account_ref)
+    rec['_accounting'] = (operation_id, provider, account_ref)
+
+
+def _finish_accounting(rec):
+    global _accounting_export_degraded
+    context = rec.get('_accounting')
+    if context is None or _accounting is None:
+        return
+    operation_id, provider, account_ref = context
+    try:
+        _accounting.complete(
+            operation_id,
+            events_for_record(rec, operation_id, provider, account_ref))
+        rec['accounting_gap'] = False
+    except (AccountingUnavailable, ValueError, OSError,
+            TypeError, KeyError):
+        # _transaction already degraded+gapped on AccountingUnavailable;
+        # only record once for mapping/other failures
+        if not _accounting.degraded:
+            _accounting.record_gap()
+        rec['accounting_gap'] = True
+        return
+    try:
+        with _accounting_lock:
+            for event_id, payload in _accounting.unexported():
+                append_private(DATA_DIR / 'receipts.jsonl',
+                               (payload + '\n').encode())
+                _accounting.mark_exported(event_id)
+    except (OSError, AccountingUnavailable, sqlite3.Error):
+        # sticky for the process lifetime — there is no durable
+        # request-log/receipt export reconciliation pass
+        _accounting_export_degraded = True
 
 HOP_BY_HOP = {"host", "content-length", "connection", "keep-alive", "te",
               "trailer", "trailers", "transfer-encoding", "upgrade",
@@ -170,7 +258,8 @@ def _save_stats() -> None:
 
 _SAFE_ROUTES = {"codex", "forward", "cognition-forward", "reject"}
 _SAFE_RPCS = {"GetChatMessage", "AssignModel", "AssignModelStarting",
-              "GetCliModelConfigs", "GetUserStatus"}
+              "GetCliModelConfigs", "GetUserStatus", "HostAck",
+              "HostCompaction"}
 _QUOTA_HEADERS = {"x-codex-primary-used-percent",
                   "x-codex-secondary-used-percent",
                   "x-codex-primary-window-minutes",
@@ -179,13 +268,33 @@ _QUOTA_HEADERS = {"x-codex-primary-used-percent",
                   "x-codex-secondary-reset-at"}
 _SAFE_CATEGORIES = {"decode_error", "request_error", "upstream_error",
                     "selection_unconfirmed", "computer_policy_denied",
-                    "cancelled", "internal"}
+                    "cancelled", "internal", "payload_budget"}
 _SAFE_NUMERIC = ("ms", "bytes", "delta_chars", "n_messages",
-                 "relay_tool_calls", "upstream_status", "codex_http_status")
-_SAFE_BOOL = ("client_gone", "relay_tool_loop_bound")
+                 "relay_tool_calls", "upstream_status", "codex_http_status",
+                 "incoming_wire_bytes", "final_serialized_bytes",
+                 "image_occurrences", "unique_image_count",
+                 "image_bytes_total", "historical_image_count",
+                 "current_turn_image_count", "budget_policy_version")
+_SAFE_REJECTION_ORIGINS = {
+    'local_wire_bytes', 'local_image_count', 'local_image_bytes',
+    'local_translated_bytes', 'upstream_image_count',
+    'upstream_image_format', 'upstream_context_limit',
+    'upstream_payload_too_large', 'upstream_unknown',
+    'native_or_pre_relay_unknown'}
+_SAFE_PAYLOAD_NUMERIC = ("incoming_wire_bytes", "decompressed_bytes",
+                         "final_serialized_bytes", "image_occurrences",
+                         "unique_image_count", "image_bytes_total",
+                         "historical_image_count",
+                         "current_turn_image_count",
+                         "budget_policy_version")
+_SAFE_BOOL = ("client_gone", "relay_tool_loop_bound", "response_refused",
+              "termination_confirmed", "accounting_gap")
 _SAFE_STATUSES = {"completed", "incomplete", "failed", "cancelled",
                   "unknown"}
 _RESPONSE_REF_RE = re.compile(r"^[0-9a-f]{64}$")
+# IncompleteResponse messages are fixed relay literals (never provider
+# content); the allowlist regex is a second guard before they are logged.
+_INCOMPLETE_DETAIL_RE = re.compile(r"^[A-Za-z0-9 _:.%/-]{1,96}$")
 
 
 def safe_record(rec: dict) -> dict:
@@ -214,6 +323,67 @@ def safe_record(rec: dict) -> dict:
     category = rec.get("error_category")
     if category in _SAFE_CATEGORIES:
         out["error_category"] = category
+    origin = rec.get("rejection_origin")
+    if origin in _SAFE_REJECTION_ORIGINS:
+        out["rejection_origin"] = origin
+    detail = rec.get("incomplete_detail")
+    if isinstance(detail, str) and _INCOMPLETE_DETAIL_RE.match(detail):
+        out["incomplete_detail"] = detail
+    names = rec.get("tool_call_names")
+    if isinstance(names, list):
+        safe_names = [n for n in names if isinstance(n, str)
+                      and _INCOMPLETE_DETAIL_RE.match(n)]
+        if safe_names:
+            out["tool_call_names"] = safe_names[:32]
+    binding = rec.get("binding_status")
+    if binding in ("verified", "unavailable", "invalid"):
+        out["binding_status"] = binding
+    acceptance = rec.get("acceptance")
+    if acceptance in ("acknowledged", "history_evidenced", "pending",
+                      "uncertain"):
+        out["acceptance"] = acceptance
+    evidenced = rec.get("turns_history_evidenced")
+    if type(evidenced) is int and evidenced >= 0:
+        out["turns_history_evidenced"] = evidenced
+    marker_status = rec.get("marker_status")
+    if marker_status in ("verified", "absent", "invalid"):
+        out["marker_status"] = marker_status
+    correlation = rec.get("compaction_correlation")
+    if correlation in ("matched_marker", "matched_seed"):
+        out["compaction_correlation"] = correlation
+    key_store = rec.get("key_store_status")
+    if key_store in ("ready", "unavailable"):
+        out["key_store_status"] = key_store
+    transition = rec.get("epoch_transition")
+    if transition in ("model_switch", "history_compaction", "fork",
+                      "account_change", "legacy_history",
+                      "history_divergence", "operator_recovery"):
+        out["epoch_transition"] = transition
+    cont = rec.get("continuation_status")
+    if cont in ("durable_host_bound", "durable_host_binding_required",
+                "legacy_memory_only_unqualified", "preflight_rejected",
+                "admission_rejected"):
+        out["continuation_status"] = cont
+    role = rec.get("continuation_role")
+    if role in ("lead", "sidekick"):
+        out["continuation_role"] = role
+    revision = rec.get("continuation_revision")
+    if type(revision) is int and revision >= 0:
+        out["continuation_revision"] = revision
+    epoch_ref = rec.get("continuation_epoch_ref")
+    if isinstance(epoch_ref, str) and _RESPONSE_REF_RE.match(epoch_ref):
+        out["continuation_epoch_ref"] = epoch_ref
+    cancellation = rec.get("cancellation")
+    if cancellation in ("requested", "uncertain"):
+        out["cancellation"] = cancellation
+    payload = rec.get("payload")
+    if isinstance(payload, dict):
+        safe_payload = {k: payload[k] for k in _SAFE_PAYLOAD_NUMERIC
+                        if type(payload.get(k)) is int and payload[k] >= 0}
+        if payload.get("image_bytes_partial") is True:
+            safe_payload["image_bytes_partial"] = True
+        if safe_payload:
+            out["payload"] = safe_payload
     usage = rec.get("codex_usage")
     if usage == "unknown":
         out["codex_usage"] = "unknown"
@@ -277,6 +447,11 @@ def safe_record(rec: dict) -> dict:
 
 
 def _log_record(rec: dict) -> None:
+    global _accounting_export_degraded
+    _finish_accounting(rec)
+    if rec.get("_session_ref"):
+        diagnostics.record(rec.get("model", ""), rec["_session_ref"],
+                           rec.get("route", ""), rec)
     safe = safe_record(rec)
     try:
         ensure_private_dir(DATA_DIR)
@@ -284,7 +459,9 @@ def _log_record(rec: dict) -> None:
                        (json.dumps(safe, separators=(",", ":")) + "\n")
                        .encode())
     except OSError:
-        pass
+        _accounting_export_degraded = True
+    if _accounting is not None:
+        return
     with _stats_lock:
         _stats["requests"] += 1
         route = safe.get("route", "?")
@@ -302,6 +479,26 @@ def _log_record(rec: dict) -> None:
                 if cu.get("input") is None or cu.get("output") is None:
                     tok["unknown_calls"] = tok.get("unknown_calls", 0) + 1
         _save_stats()
+
+
+# The CLI issues AssignModel and the first GetChatMessage of a turn back to
+# back (observed live: a sidekick spawn's AssignModel overlapped the
+# lead's inference). A selection that is merely in flight is not a
+# conflict — wait briefly for it to settle, then fail closed as before.
+SELECTION_GRACE_S = float(os.environ.get("FUSION_RELAY_SELECTION_GRACE",
+                                         "2.0"))
+
+
+def _session_route_settled(packet):
+    deadline = time.monotonic() + SELECTION_GRACE_S
+    while True:
+        try:
+            return catalog.session_route(packet)
+        except RouteStateError as e:
+            if str(e) != "selection_unconfirmed" \
+                    or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def route_for_model(model: str) -> str:
@@ -449,7 +646,10 @@ def _forward(body: bytes, headers, path: str) -> ForwardResponse:
     req = urllib.request.Request(UPSTREAM + path, data=body, headers=out_headers,
                                  method="POST")
     try:
-        resp = urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT)
+        resp = open_request(req, timeout=UPSTREAM_TIMEOUT)
+    except RedirectBlocked as e:
+        e.close()
+        raise RuntimeError('upstream redirect blocked') from None
     except urllib.error.HTTPError as e:
         resp = e
     try:
@@ -544,11 +744,18 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, socket.error):
             return False
 
-    def _send_stream_head(self, ctype: str) -> bool:
+    def _send_stream_head(self, ctype: str, status: int = 200,
+                          extra_headers: dict | None = None) -> bool:
         try:
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Transfer-Encoding", "chunked")
+            for k, v in (extra_headers or {}).items():
+                kl = k.lower()
+                if kl in HOP_BY_HOP or kl in ("content-length",
+                                              "content-type"):
+                    continue
+                self.send_header(k, v)
             self.end_headers()
             return True
         except (BrokenPipeError, ConnectionResetError, socket.error):
@@ -570,18 +777,156 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _client_disconnected(self) -> bool:
-        """Peek the socket: read-ready + empty peek means the client hung up.
+        """Probe the socket: nonzero SO_ERROR means the client is gone.
 
-        Never consumes bytes; errors are treated as gone.
+        A half-close (client SHUT_WR) or an empty peek is not a
+        disconnect — a clean FIN only means the client finished sending;
+        a full close surfaces on the next write. Never consumes bytes.
         """
         try:
+            if self.connection.getsockopt(socket.SOL_SOCKET,
+                                          socket.SO_ERROR):
+                return True
             ready, _, _ = select.select([self.connection], [], [], 0)
             if not ready:
                 return False
-            return self.connection.recv(
-                1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+            self.connection.recv(
+                1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            return False
+        except BlockingIOError:
+            return False
         except (OSError, ValueError):
             return True
+
+    def _stream_native(self, body: bytes, path: str, rec: dict) -> None:
+        """Stream a native Cognition response through, byte-for-byte.
+
+        Raw upstream bytes are relayed as HTTP chunks as they arrive —
+        no whole-response buffering. The Connect envelope is observed
+        incrementally for usage only when the upstream content type is
+        ``application/connect+proto`` with identity/no HTTP encoding.
+        """
+        from .native_stream import ConnectObserver, StreamFailure, \
+            stream_native
+        started = time.time()
+        named = {t.strip().lower()
+                 for t in (self.headers.get("Connection") or "").split(",")}
+        out_headers = {k: v for k, v in self.headers.items()
+                       if k.lower() not in HOP_BY_HOP
+                       and k.lower() not in named}
+        context = RequestContext(timeout=UPSTREAM_TIMEOUT)
+        state = {"head": False, "observe": False}
+
+        def observe_frame(raw):
+            usage = _peek_chat_usage(raw)
+            if usage:
+                rec['cognition_usage'] = usage
+
+        observer = ConnectObserver(observe_frame)
+
+        async def on_headers(status: int, headers: dict):
+            if status in (204, 304):
+                raise StreamFailure(
+                    "bodyless status incompatible with stream")
+            rec["upstream_status"] = status
+            ctype = headers.get("content-type", "application/proto")
+            named = {t.strip().lower()
+                     for t in (headers.get("connection") or "").split(",")}
+            extras = {k: v for k, v in headers.items()
+                      if (k.lower() in RESPONSE_PASS
+                          or k.lower() == "content-encoding")
+                      and k.lower() not in named}
+            if not self._send_stream_head(ctype, status=status,
+                                          extra_headers=extras):
+                raise RequestCancelled("request_cancelled")
+            state["head"] = True
+            self.wfile.flush()
+            self.connection.setblocking(False)
+            enc = headers.get("content-encoding")
+            state["observe"] = (
+                ctype.split(";", 1)[0].strip().lower()
+                == "application/connect+proto"
+                and (enc is None or enc.lower() == "identity"))
+
+        def observe(chunk: bytes):
+            if state["observe"]:
+                observer.feed(chunk)
+
+        def check():
+            context.check()
+            try:
+                if self.connection.getsockopt(socket.SOL_SOCKET,
+                                              socket.SO_ERROR):
+                    raise RequestCancelled("request_cancelled")
+            except OSError:
+                raise RequestCancelled("request_cancelled")
+
+        def on_cleanup(confirmed):
+            rec["termination_confirmed"] = confirmed
+
+        async def pump():
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + float(UPSTREAM_TIMEOUT)
+
+            async def write(chunk: bytes):
+                await asyncio.wait_for(
+                    loop.sock_sendall(
+                        self.connection,
+                        b"%x\r\n" % len(chunk) + chunk + b"\r\n"),
+                    min(30.0, float(UPSTREAM_TIMEOUT)))
+
+            await stream_native(
+                UPSTREAM + path, body, out_headers,
+                on_headers=on_headers, write=write, check=check,
+                observe=observe, on_cleanup=on_cleanup,
+                idle_timeout=min(30.0, float(UPSTREAM_TIMEOUT)),
+                total_timeout=float(UPSTREAM_TIMEOUT),
+                max_bytes=MAX_UPSTREAM_BYTES)
+            if state["observe"]:
+                observer.finish()
+            context.check()
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise RequestCancelled("request_cancelled")
+            await asyncio.wait_for(
+                loop.sock_sendall(self.connection, b"0\r\n\r\n"),
+                min(float(_SOCKET_IDLE_S), remaining))
+
+        failure = None
+        try:
+            asyncio.run(asyncio.wait_for(
+                pump(), float(UPSTREAM_TIMEOUT) + 1.2))
+        except RequestCancelled:
+            rec["client_gone"] = True
+            failure = "cancelled"
+        except Exception:
+            failure = "upstream_error"
+        finally:
+            try:
+                self.connection.setblocking(True)
+                self.connection.settimeout(_SOCKET_IDLE_S)
+            except OSError:
+                failure = failure or "upstream_error"
+            rec["route"] = "cognition-forward"
+            rec["ms"] = round((time.time() - started) * 1000)
+            rec.setdefault("cognition_usage", "unknown")
+            if failure:
+                rec["error_category"] = failure
+            _log_record(rec)
+        if not failure:
+            return
+        if state["head"]:
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        else:
+            self._send(200, error_frame(
+                "cancelled" if failure == "cancelled" else "unavailable",
+                "request cancelled" if failure == "cancelled"
+                else "upstream request failed"),
+                "application/connect+proto")
 
     def _read_request_body(self) -> tuple[int, bytes | None]:
         """Read exactly Content-Length bytes under a total deadline.
@@ -631,10 +976,135 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+    def _host_compaction(self, body: bytes) -> None:
+        """POST /host/compaction — native /compact hook receiver.
+
+        The hook carries only a session id and a presence flag; the
+        summary text never enters the relay. Correlation between the
+        hook's session_id and the wire seed (field 16) is unverified —
+        a matching note merely permits a 'history_compaction' epoch
+        transition; a mismatch fails closed.
+        """
+        rec = {"rpc": "HostCompaction"}
+        ctype = self.headers.get("Content-Type", "").split(
+            ";", 1)[0].strip().lower()
+        payload = None
+        if len(body) <= (4 << 10) and ctype == "application/json":
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = None
+        if not isinstance(payload, dict) \
+                or set(payload) != {"protocol_version", "session_id",
+                                    "summary_present"} \
+                or payload["protocol_version"] != 1 \
+                or not isinstance(payload["session_id"], str) \
+                or not payload["session_id"] \
+                or len(payload["session_id"]) > 512 \
+                or not isinstance(payload["summary_present"], bool):
+            rec.update(route="reject", error_category="request_error")
+            _log_record(rec)
+            return self._send(400, b'{"error":"compaction rejected"}',
+                              "application/json")
+        session_ref = reference("session", payload["session_id"])
+        diagnostics.record_compaction(session_ref)
+        coordinator = _continuation_coordinator
+        if coordinator is not None:
+            coordinator.note_compaction(session_ref)
+        rec["route"] = "codex"
+        rec["_session_ref"] = session_ref
+        _log_record(rec)
+        return self._send(
+            200, b'{"recorded":true,"correlation":"unverified"}',
+            "application/json")
+
+    def _host_ack(self, body: bytes) -> None:
+        """POST /host/ack — durable-result acknowledgement.
+
+        Requires the three binding headers; the ack body itself is the
+        signed payload (body_digest = digest(parsed ack)).
+        """
+        rec = {"rpc": "HostAck"}
+        coordinator = _continuation_coordinator
+        if coordinator is None:
+            _log_record(rec)
+            return self._send(503, b'{"error":"acknowledgement unavailable"}',
+                              "application/json")
+        ctype = self.headers.get("Content-Type", "").split(
+            ";", 1)[0].strip().lower()
+        ack = None
+        if len(body) <= (16 << 10) and ctype == "application/json":
+            try:
+                ack = json.loads(body)
+            except ValueError:
+                ack = None
+        if not isinstance(ack, dict):
+            rec.update(route="reject", error_category="request_error")
+            _log_record(rec)
+            return self._send(400, b'{"error":"acknowledgement rejected"}',
+                              "application/json")
+        try:
+            context = context_from_headers(
+                self.headers, digest(ack), time.time())
+        except BindingError:
+            context = "invalid"
+        if context is None or context == "invalid":
+            rec["binding_status"] = "invalid" if context else "unavailable"
+            _log_record(rec)
+            return self._send(403, b'{"error":"binding rejected"}',
+                              "application/json")
+        try:
+            result = coordinator.acknowledge(context, ack)
+        except BindingError:
+            rec["binding_status"] = "invalid"
+            _log_record(rec)
+            return self._send(403, b'{"error":"binding rejected"}',
+                              "application/json")
+        except (ContinuationError, sqlite3.Error):
+            _log_record(rec)
+            return self._send(409, b'{"error":"acknowledgement rejected"}',
+                              "application/json")
+        rec["binding_status"] = "verified"
+        rec["acceptance"] = result["acceptance"]
+        if isinstance(ack.get("session_id"), str):
+            rec["_session_ref"] = reference("session", ack["session_id"])
+        _log_record(rec)
+        return self._send(200, json.dumps(result).encode(),
+                          "application/json")
+
     # -- routing -----------------------------------------------------------
     def do_GET(self):
+        if self.path == "/identity" or self.path.startswith("/identity?"):
+            ident = getattr(self.server, "identity", None)
+            if ident is None:
+                return self._send(503, b"identity unavailable",
+                                  "text/plain")
+            split = urllib.parse.urlsplit(self.path)
+            if split.fragment:
+                return self._send(400, b"invalid nonce", "text/plain")
+            try:
+                params = urllib.parse.parse_qs(
+                    split.query, keep_blank_values=True,
+                    strict_parsing=True, max_num_fields=1)
+            except ValueError:
+                return self._send(400, b"invalid nonce", "text/plain")
+            if set(params) != {"nonce"} or len(params["nonce"]) != 1:
+                return self._send(400, b"invalid nonce", "text/plain")
+            nonce = params["nonce"][0]
+            if not re.fullmatch(r"[0-9a-f]{64}", nonce):
+                return self._send(400, b"invalid nonce", "text/plain")
+            return self._send(200, json.dumps(ident.proof(nonce)).encode(),
+                              "application/json")
         if self.path == "/healthz":
-            return self._send(200, json.dumps({"ok": True}).encode(), "application/json")
+            acct = accounting_status()
+            ok = not acct["degraded"]
+            code = 503 if _accounting_required and not ok else 200
+            public = {k: acct.get(k, False) for k in (
+                "degraded", "coverage", "reconciliation_required",
+                "export_degraded")}
+            return self._send(code, json.dumps(
+                {"ok": ok, "accounting": public}).encode(),
+                "application/json")
         if self._authorized_path() == "/capabilities":
             caps = cua.CuaProvider(DATA_DIR).compatibility()
             caps.update({
@@ -642,7 +1112,34 @@ class Handler(BaseHTTPRequestHandler):
                 "consent_ui": "unavailable",
                 "detached_tasks": False,
                 "operation_journal": "local_contract_only",
-                "image_feedback": "vision_unavailable"})
+                "continuation": (
+                    "durable_host_bound" if _continuation_coordinator
+                    is not None else
+                    "durable_host_binding_required"
+                    if CONTINUATION_MODE == "durable" else
+                    "legacy_memory_only_unqualified"),
+                "native_ack_contract": "unavailable",
+                "host_ack_endpoint": "local_contract_only",
+                "native_marker_hook": "user_prompt_submit_additional_context",
+                "qualification": diagnostics.qualification(),
+                "binding_issuer": "none_native",
+                "native_transport": "streaming",
+                "image_feedback": "vision_unavailable",
+                "payload_budget": {
+                    "policy_version": BUDGET_POLICY_VERSION,
+                    "codex": {
+                        "max_image_occurrences":
+                            payload_budget.CODEX_PROFILE
+                            .max_image_occurrences,
+                        "max_image_bytes_total":
+                            payload_budget.CODEX_PROFILE
+                            .max_image_bytes_total,
+                        "max_serialized_bytes":
+                            payload_budget.CODEX_PROFILE
+                            .max_serialized_bytes,
+                        "provenance":
+                            payload_budget.CODEX_PROFILE.provenance,
+                        "upstream_limit_status": "unverified"}}})
             return self._send(200, json.dumps(caps, indent=2).encode(),
                               "application/json")
         if self._authorized_path() == "/stats":
@@ -650,7 +1147,26 @@ class Handler(BaseHTTPRequestHandler):
                 snap = dict(_stats, by_route=dict(_stats["by_route"]))
             snap["uptime_s"] = round(time.time() - _stats["started"], 1)
             snap["log"] = str(REQUESTS_LOG)
+            snap["accounting"] = accounting_status()
+            snap["legacy_totals_unverified"] = True
             return self._send(200, json.dumps(snap, indent=2).encode(), "application/json")
+        if self._authorized_path().split("?", 1)[0] == "/diagnostics":
+            split = urllib.parse.urlsplit(self.path)
+            try:
+                params = urllib.parse.parse_qs(split.query,
+                                               max_num_fields=1)
+            except ValueError:
+                return self._send(404, b"not found", "text/plain")
+            if split.fragment or set(params) != {"session"} \
+                    or len(params["session"]) != 1:
+                return self._send(404, b"not found", "text/plain")
+            entry = diagnostics.snapshot(params["session"][0])
+            if entry is None:
+                return self._send(404, b"unknown session", "text/plain")
+            return self._send(200, json.dumps(
+                {"session": entry,
+                 "accounting": accounting_status()}, indent=2).encode(),
+                "application/json")
         return self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
@@ -672,6 +1188,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(status, error_frame(
                 "resource_exhausted" if status == 413 else "invalid_argument",
                 "request body rejected"), "application/connect+proto")
+        if path == "/shutdown":
+            if body != b"":
+                return self._send(400, error_frame(
+                    "invalid_argument", "shutdown takes no body"),
+                    "application/json")
+            self._send(200, b'{"ok": true}', "application/json")
+            threading.Thread(target=self.server.shutdown,
+                             daemon=True).start()
+            return
+        if path == "/host/compaction":
+            return self._host_compaction(body)
+        if path == "/host/ack":
+            return self._host_ack(body)
         rec: dict = {"rpc": path}
         req_ctype = self.headers.get("Content-Type", "").split(
             ";", 1)[0].strip().lower()
@@ -836,7 +1365,7 @@ class Handler(BaseHTTPRequestHandler):
                 "application/connect+proto")
         try:
             model = _singleton_text(packet, 21)
-            _singleton_text(packet, 16)  # session id, required for routing
+            session_seed = _singleton_text(packet, 16)
         except (ValueError, TypeError, UnicodeError):
             rec.update(route="reject", error_category="decode_error")
             _log_record(rec)
@@ -844,10 +1373,21 @@ class Handler(BaseHTTPRequestHandler):
                 "invalid_argument", "request decode failed"),
                 "application/connect+proto")
         rec["model"] = model
+        # diagnostics are keyed only by the hashed session reference —
+        # the raw seed is never stored
+        rec["_session_ref"] = reference("session", session_seed)
         rec["n_messages"] = len(packet.get(3, []))
+        # Native-hook marker (UserPromptSubmit additionalContext): verified
+        # against the relay identity key; correlates hook session names
+        # with this wire session. Never a lane or acceptance claim.
+        marker_result = marker.extract(packet, getattr(
+            getattr(self.server, "identity", None), "secret", None))
+        rec["marker_status"] = marker_result.status
+        if marker_result.status == "verified":
+            rec["_marker_session_ref"] = marker_result.session_name_ref
         route = route_for_model(model)
         try:
-            pinned = catalog.session_route(packet)
+            pinned = _session_route_settled(packet)
         except RouteStateError:
             rec.update(route="reject",
                        error_category="selection_unconfirmed")
@@ -862,21 +1402,24 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "forward":
             try:
-                resp = _forward(body, self.headers, path)
-            except Exception:
-                rec.update(route="cognition-forward",
-                           error_category="upstream_error")
-                _log_record(rec)
+                binding_secret = getattr(
+                    getattr(self.server, 'identity', None), 'secret', None)
+                if _accounting is not None and binding_secret is None:
+                    raise AccountingUnavailable(
+                        'native account binding unavailable')
+                import hmac
+                binding = hmac.new(
+                    binding_secret or b'',
+                    self.headers.get('Authorization', '').encode(),
+                    hashlib.sha256).hexdigest()
+                _admit_accounting(rec, 'native',
+                                  reference('native', binding))
+            except AccountingUnavailable:
                 return self._send(200, error_frame(
-                    "unavailable", "upstream request failed"),
-                    "application/connect+proto")
-            rec.update(route="cognition-forward", upstream_status=resp.status,
-                       ms=round((time.time() - started) * 1000))
-            usage = _peek_chat_usage(resp.body)
-            rec["cognition_usage"] = usage if usage else "unknown"
-            _log_record(rec)
-            return self._send(resp.status, resp.body, resp.content_type,
-                              extra_headers=resp.headers)
+                    'failed_precondition',
+                    'durable accounting unavailable'),
+                    'application/connect+proto')
+            return self._stream_native(body, path, rec)
 
         if route == "reject":
             rec.update(route="reject", error_category="request_error")
@@ -889,6 +1432,23 @@ class Handler(BaseHTTPRequestHandler):
         routed = parse_routed_model(model)
         rec["route"] = "codex"
         rec["effort"] = routed.effort
+        # Local payload budget (policy v1, not a vendor limit): a coarse
+        # wire-size bound runs before translation so an image-heavy
+        # request is rejected before the expensive encode.
+        profile = payload_budget.profile_for('codex')
+        report = PayloadReport(route='codex', profile=profile.profile,
+                               budget_policy_version=BUDGET_POLICY_VERSION)
+        rec['_payload_report'] = report
+        try:
+            payload_budget.coarse_incoming_check(len(body), profile, report)
+        except BudgetExceeded as e:
+            rec['error_category'] = 'payload_budget'
+            rec['rejection_origin'] = e.report.rejection_origin
+            rec['payload'] = report.safe_dict()
+            _log_record(rec)
+            return self._send(200, error_frame(
+                'resource_exhausted', e.user_message()),
+                'application/connect+proto')
         # One auth read covers the continuity scope and the inference
         # request so the cache account and the billed account cannot race.
         # The scope is "unverified": no trusted role binding exists, so it
@@ -903,9 +1463,13 @@ class Handler(BaseHTTPRequestHandler):
                 "unauthenticated",
                 "Codex login unavailable or expired; renew it in Codex"),
                 "application/connect+proto")
-        continuity_scope = hashlib.sha256("\0".join(
-            (credentials[1], routed.model, routed.effort, "unverified")
-        ).encode()).hexdigest()
+        # Durable continuation replaces the in-memory caches: they stay
+        # disabled (empty scope) so no unqualified reinjection can mix
+        # with the ledger-owned history merge.
+        if CONTINUATION_MODE != "durable":
+            continuity_scope = hashlib.sha256("\0".join(
+                (credentials[1], routed.model, routed.effort, "unverified")
+            ).encode()).hexdigest()
         try:
             req_body = packet_to_responses_body(
                 packet, routed, rec, continuity_scope=continuity_scope)
@@ -916,6 +1480,154 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, error_frame(
                 "invalid_argument", "request not translatable"),
                 "application/connect+proto")
+        # Image budget on the translated body — before any continuation
+        # reservation or accounting admission, so a preflight failure
+        # reserves nothing and admits nothing.
+        try:
+            payload_budget.measure_body(req_body, profile, report)
+        except BudgetExceeded as e:
+            rec['error_category'] = 'payload_budget'
+            rec['rejection_origin'] = e.report.rejection_origin
+            rec['payload'] = report.safe_dict()
+            _log_record(rec)
+            return self._send(200, error_frame(
+                'resource_exhausted', e.user_message()),
+                'application/connect+proto')
+        rec['payload'] = report.safe_dict()
+
+        # Durable continuation: the host coordinator owns history merge,
+        # replay, and commit. A replay never admits accounting or calls
+        # the provider; a fresh reservation stays conservative-pending if
+        # admission below fails.
+        coordinator = _continuation_coordinator  # pinned for this request
+        continuation_binding = None
+        continuation_reservation = None
+        if CONTINUATION_MODE == "durable":
+            if coordinator is None:
+                rec["error_category"] = "request_error"
+                rec["continuation_status"] = "durable_host_binding_required"
+                _log_record(rec)
+                return self._send(200, error_frame(
+                    "failed_precondition",
+                    "trusted continuation binding unavailable"),
+                    "application/connect+proto")
+            rec["key_store_status"] = coordinator.key_store_status
+            context = None
+            if coordinator.binding_mode == 'capabilities':
+                try:
+                    context = context_from_headers(
+                        self.headers, digest(req_body), time.time())
+                except BindingError:
+                    context = "malformed"
+            try:
+                if context == "malformed":
+                    raise BindingError('malformed binding headers')
+                continuation_binding, continuation_reservation = \
+                    coordinator.prepare(
+                        packet, req_body, credentials, context,
+                        marker_session_ref=rec.get("_marker_session_ref"))
+            except BindingError:
+                rec["error_category"] = "request_error"
+                rec["binding_status"] = "invalid"
+                rec["continuation_status"] = "durable_host_binding_required"
+                _log_record(rec)
+                return self._send(200, error_frame(
+                    "permission_denied",
+                    "continuation binding rejected"),
+                    "application/connect+proto")
+            except ContinuationError as e:
+                rec["error_category"] = "request_error"
+                rec["binding_status"] = \
+                    "unavailable" if context is None else "verified"
+                rec["continuation_status"] = "durable_host_binding_required"
+                _log_record(rec)
+                # Store/coordinator messages are sanitized literals; a
+                # legacy resolver's exception text is untrusted.
+                message = str(e) if (
+                    coordinator.binding_mode == 'capabilities'
+                    and isinstance(e, ContinuationError)) else \
+                    "trusted continuation binding unavailable"
+                return self._send(200, error_frame(
+                    "failed_precondition", message),
+                    "application/connect+proto")
+            except (sqlite3.Error, UnicodeError, ValueError):
+                rec["error_category"] = "request_error"
+                rec["binding_status"] = \
+                    "unavailable" if context is None else "verified"
+                rec["continuation_status"] = "durable_host_binding_required"
+                _log_record(rec)
+                return self._send(200, error_frame(
+                    "failed_precondition",
+                    "trusted continuation binding unavailable"),
+                    "application/connect+proto")
+            rec["continuation_status"] = "durable_host_bound"
+            rec["binding_status"] = "verified" if (
+                context is not None
+                and coordinator.binding_mode == 'capabilities') \
+                else "unavailable"
+            rec["continuation_role"] = continuation_binding.lane
+            if continuation_reservation.get("epoch_transition"):
+                rec["epoch_transition"] = \
+                    continuation_reservation["epoch_transition"]
+            if continuation_reservation.get("compaction_correlation"):
+                rec["compaction_correlation"] = \
+                    continuation_reservation["compaction_correlation"]
+            rec["continuation_epoch_ref"] = reference(
+                "epoch", continuation_binding.epoch)
+            if type(continuation_reservation.get("evidenced")) is int:
+                rec["turns_history_evidenced"] = \
+                    continuation_reservation["evidenced"]
+            if continuation_reservation.get("replay") is not None:
+                # Route replay through execute so the binding check runs
+                # before stored wire bytes are released.
+                rec["continuation_revision"] = \
+                    continuation_reservation["revision"]
+                try:
+                    out = coordinator.execute(
+                        continuation_binding, continuation_reservation,
+                        lambda b, o, s: (_ for _ in ()).throw(
+                            AssertionError("replay must not invoke")))
+                except (ContinuationError, sqlite3.Error, ValueError):
+                    rec["error_category"] = "request_error"
+                    _log_record(rec)
+                    return self._send(200, error_frame(
+                        "failed_precondition",
+                        "trusted continuation binding unavailable"),
+                        "application/connect+proto")
+                rec["acceptance"] = coordinator.acceptance(
+                    continuation_binding, continuation_reservation)
+                _log_record(rec)
+                return self._send(
+                    200, out, "application/connect+proto",
+                    extra_headers={
+                        "X-Fusion-Continuation-Epoch":
+                            continuation_binding.epoch,
+                        "X-Fusion-Continuation-Revision":
+                            str(continuation_reservation["revision"])})
+
+        # Credentials are pinned and the request translated; admission
+        # must precede the stream head so no unbilled bytes reach the
+        # client. Pre-admission failure means no provider call at all.
+        try:
+            _admit_accounting(rec, 'codex',
+                              reference('codex', credentials[1]))
+        except AccountingUnavailable:
+            if continuation_reservation is not None:
+                # Reserved but provably never dispatched: release the
+                # lane instead of stranding it as outcome-unknown. If
+                # the settle itself fails the row stays 'executing' and
+                # is operator-resolvable.
+                try:
+                    coordinator.abandon(continuation_reservation,
+                                        'admission_rejected')
+                    rec["continuation_status"] = "admission_rejected"
+                except (ContinuationError, sqlite3.Error):
+                    pass
+            rec["error_category"] = "request_error"
+            _log_record(rec)
+            return self._send(200, error_frame(
+                'failed_precondition', 'durable accounting unavailable'),
+                'application/connect+proto')
 
         # Computer dispatch fails closed: no trusted dispatcher, consent
         # UI, or qualified runtime — see GET /capabilities.
@@ -925,18 +1637,69 @@ class Handler(BaseHTTPRequestHandler):
         # Disconnect policy: cancel, never detached. The blocking upstream
         # read is timeout-bounded; cancellation is observed at boundaries.
         context = RequestContext(disconnected=self._client_disconnected)
+        # Only after a successful stream head may errors be written as
+        # Connect trailers; before it, failures need a full HTTP response.
+        stream_started = False
         try:
-            if STREAM_MODE == "delta":
+            if continuation_reservation is not None:
+                # Buffered invoke: no deltas reach the client until the
+                # turn is durably committed; a commit failure surfaces as
+                # an error frame, never a successful trailer.
+                def invoke(native_body, items, serialized):
+                    result = call_codex(
+                        native_body, rec, _items_out=items,
+                        check_cancelled=context.check,
+                        credentials=credentials,
+                        serialized=serialized)
+                    # No trusted dispatcher or consent UI exists; a
+                    # provider-emitted computer call is never deliverable.
+                    if any(item.get("type") == "function_call"
+                           and item.get("name") == CUA_TOOL_NAME
+                           for item in items):
+                        raise UnsupportedRequest(
+                            "computer_policy_denied")
+                    return result
+
+                def preflight(merged):
+                    # Measure + serialize the merged body (continuation
+                    # reinsertion included); the exact returned bytes are
+                    # what invoke sends.
+                    payload_budget.measure_body(merged, profile, report)
+                    try:
+                        return payload_budget.serialize_and_check(
+                            merged, profile, report)
+                    finally:
+                        rec['payload'] = report.safe_dict()
+
+                out = coordinator.execute(
+                    continuation_binding, continuation_reservation, invoke,
+                    preflight=preflight)
+                rec["continuation_revision"] = \
+                    continuation_reservation["revision"] + 1
+                try:
+                    rec["acceptance"] = coordinator.acceptance(
+                        continuation_binding, continuation_reservation)
+                except (ContinuationError, sqlite3.Error):
+                    pass
+                self._send(200, out, "application/connect+proto",
+                           extra_headers={
+                               "X-Fusion-Continuation-Epoch":
+                                   continuation_binding.epoch,
+                               "X-Fusion-Continuation-Revision":
+                                   str(continuation_reservation
+                                       ["revision"] + 1)})
+            elif STREAM_MODE == "delta":
                 if not self._send_stream_head("application/connect+proto"):
                     rec["client_gone"] = True
-                    _log_record(rec)
                     return
+                stream_started = True
                 def on_delta(payload: bytes) -> bool:
                     return self._write_chunk(payload)
                 tail = call_codex_with_tools(req_body, rec, on_delta=on_delta,
                                              executor=executor,
                                              check_cancelled=context.check,
-                                             credentials=credentials)
+                                             credentials=credentials,
+                                             budget_profile=profile)
                 for flags, payload in iter_frames(tail):
                     if not self._write_chunk(bytes([flags]) + len(payload).to_bytes(4, "big") + payload):
                         rec["client_gone"] = True
@@ -945,14 +1708,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 out = call_codex_with_tools(req_body, rec, executor=executor,
                                             check_cancelled=context.check,
-                                            credentials=credentials)
+                                            credentials=credentials,
+                                            budget_profile=profile)
                 self._send(200, out, "application/connect+proto")
         except RequestCancelled:
             rec["client_gone"] = True
             rec["error_category"] = "cancelled"
+            if continuation_reservation is not None:
+                # Only a socket close was observed — the provider never
+                # confirmed cancellation of the inference.
+                rec["cancellation"] = "requested"
             if self._client_disconnected():
                 self.close_connection = True
-            elif STREAM_MODE == "delta":
+            elif stream_started:
                 self._write_chunk(error_frame("cancelled",
                                               "request cancelled"))
                 self._write_last_chunk()
@@ -963,15 +1731,42 @@ class Handler(BaseHTTPRequestHandler):
         except IncompleteResponse as e:
             # Truncation must never look like success — send an explicit error.
             rec["error_category"] = "request_error"
-            if STREAM_MODE == "delta":
+            rec["incomplete_detail"] = str(e)
+            if stream_started:
                 self._write_chunk(error_frame("out_of_range", str(e)))
                 self._write_last_chunk()
             else:
                 self._send(200, error_frame("out_of_range", str(e)),
                            "application/connect+proto")
+        except BudgetExceeded as e:
+            # Post-merge preflight rejection (durable path): the
+            # reservation was abandoned, the lane is free to retry.
+            rec["error_category"] = "payload_budget"
+            rec["rejection_origin"] = e.report.rejection_origin
+            rec["payload"] = e.report.safe_dict()
+            if continuation_reservation is not None:
+                rec["continuation_status"] = "preflight_rejected"
+            if stream_started:
+                self._write_chunk(error_frame("resource_exhausted",
+                                              e.user_message()))
+                self._write_last_chunk()
+            else:
+                self._send(200, error_frame("resource_exhausted",
+                                            e.user_message()),
+                           "application/connect+proto")
+        except UpstreamRejected as e:
+            # Structured, sanitized provider rejection — the raw error
+            # body was classified and discarded in call_codex.
+            code = connect_code_for(e.rejection.classification)
+            if stream_started:
+                self._write_chunk(error_frame(code, e.user_message()))
+                self._write_last_chunk()
+            else:
+                self._send(200, error_frame(code, e.user_message()),
+                           "application/connect+proto")
         except Exception:  # auth failure, HTTP error, stream failure
             rec["error_category"] = "internal"
-            if STREAM_MODE == "delta":
+            if stream_started:
                 self._write_chunk(error_frame("internal",
                                               "upstream request failed"))
                 self._write_last_chunk()
@@ -986,6 +1781,8 @@ class Handler(BaseHTTPRequestHandler):
 
 class _BoundedServer(ThreadingHTTPServer):
     """ThreadingHTTPServer capped at MAX_HANDLERS concurrent requests."""
+
+    daemon_threads = False   # server_close waits for in-flight requests
 
     def process_request(self, request, client_address):
         if not _HANDLER_SLOTS.acquire(blocking=False):
@@ -1007,22 +1804,92 @@ class _BoundedServer(ThreadingHTTPServer):
             _HANDLER_SLOTS.release()
 
 
+def _qualification_status(private, identity) -> dict:
+    """Verified qualification receipt for this tree, or the weakest level.
+    Any problem reading it degrades the label — never startup."""
+    try:
+        return qualification.status(private, getattr(identity, "secret",
+                                                     None))
+    except Exception:
+        return {"level": "local_tests", "receipt": "invalid",
+                "evidence_count": 0}
+
+
+@contextlib.contextmanager
+def _graceful_signals(server):
+    """Turn SIGTERM/SIGINT into ``server.shutdown()`` so ``serve()``'s
+    ``finally`` runs and the accounting run is closed clean.
+
+    launchd stops the service with SIGTERM; without this Python dies
+    mid-run and the next start comes up degraded. Handlers are installed
+    only from the main thread (an in-thread ``serve()`` is unaffected)
+    and restored afterwards. ``shutdown()`` must not be called from the
+    serving thread, so it runs on a short-lived daemon thread.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+
+    def _handler(signum, frame):
+        print(f"fusion-relay: shutting down (signal {signum})",
+              file=sys.stderr, flush=True)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.signal(signum, _handler)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
 def serve(port: int = DEFAULT_PORT) -> None:
-    with store_owner(DATA_DIR):
-        _stats["started"] = time.time()
-        relay_token()
-        catalog.attach_store(ROUTES_PATH)
-        _load_stats()
-        try:
-            auth.get_token()  # fail fast if not logged in
-        except auth.AuthError as e:
-            print(f"fusion-relay: {e}", file=sys.stderr)
-            sys.exit(2)
-        with _BoundedServer(("127.0.0.1", port), Handler) as server:
-            print(f"fusion-relay listening on 127.0.0.1:{port}  "
-                  f"upstream={UPSTREAM}  stream={STREAM_MODE}  "
-                  f"aux={AUX_POLICY}")
-            server.serve_forever()
+    if CONTINUATION_MODE not in ("legacy", "durable"):
+        print(f"fusion-relay: unsupported FUSION_RELAY_CONTINUATION "
+              f"{CONTINUATION_MODE!r}", file=sys.stderr)
+        sys.exit(2)
+    with PrivateDirectory(DATA_DIR, create=True) as private:
+        with store_owner(DATA_DIR):
+            _stats["started"] = time.time()
+            relay_token()
+            catalog.attach_store(ROUTES_PATH)
+            _load_stats()
+            try:
+                auth.get_token()  # fail fast if not logged in
+            except auth.AuthError as e:
+                print(f"fusion-relay: {e}", file=sys.stderr)
+                sys.exit(2)
+            global _accounting, _accounting_required, \
+                _accounting_export_degraded
+            _accounting_required = True
+            _accounting = None
+            _accounting_export_degraded = False
+            try:
+                # Durable accounting must exist before the service can
+                # admit billable work; construction failure never opens
+                # the port and leaves no sticky globals behind.
+                _accounting = AccountingLedger(
+                    DATA_DIR / 'accounting.sqlite3')
+                with _BoundedServer(("127.0.0.1", port), Handler) \
+                        as server:
+                    server.identity = ServiceIdentity.create(
+                        private, server.server_address[1])
+                    diagnostics.set_qualification(
+                        _qualification_status(private, server.identity))
+                    print(f"fusion-relay listening on 127.0.0.1:{port}  "
+                          f"upstream={UPSTREAM}  stream={STREAM_MODE}  "
+                          f"aux={AUX_POLICY}")
+                    with _graceful_signals(server):
+                        server.serve_forever()
+            finally:
+                try:
+                    if _accounting is not None:
+                        _accounting.close(clean=True)
+                finally:
+                    _accounting = None
+                    _accounting_required = False
 
 
 if __name__ == "__main__":

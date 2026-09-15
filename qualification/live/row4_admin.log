@@ -1,0 +1,13 @@
+{"operation_id": "510980d0565a7b1b8c97ec1229b5f610", "scope": "372dca588f2b3896e20978b9a260be99bbf235c8cd445f8f8cfc4ccc55767d7a", "status": "cancel_unconfirmed"}
+{"operation_id": "42f9c3217882e16e93b14ab60067d94c", "scope": "c7ba338f759af0fd74eb44b52f9ce5029bb08170573dea0ced086b901334ea25", "status": "executing"}
+exit=3
+resolved abandoned
+exit=0
+{"operation_id": "42f9c3217882e16e93b14ab60067d94c", "scope": "c7ba338f759af0fd74eb44b52f9ce5029bb08170573dea0ced086b901334ea25", "status": "executing"}
+== resolve stranded executing row (admission failure, never dispatched)
+resolved abandoned
+exit=0
+== list-unresolved (default):
+(end)
+== with --include-retryable:
+(end)

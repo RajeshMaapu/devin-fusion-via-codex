@@ -314,15 +314,14 @@ class CallCodexTest(unittest.TestCase):
         translate.auth.get_token = self._auth  # type: ignore
 
     def _run(self, events, on_delta=None):
-        import urllib.request
         fake = _FakeSSE(events)
-        orig = urllib.request.urlopen
-        urllib.request.urlopen = lambda *a, **k: fake  # type: ignore
+        orig = translate.open_request
+        translate.open_request = lambda *a, **k: fake  # type: ignore
         try:
             return translate.call_codex({"prompt_cache_key": "k"}, {},
                                         on_delta=on_delta), fake
         finally:
-            urllib.request.urlopen = orig  # type: ignore
+            translate.open_request = orig  # type: ignore
 
     def test_buffered_mode_emits_full_text_then_terminal(self) -> None:
         events = [
@@ -366,18 +365,59 @@ class CallCodexTest(unittest.TestCase):
         events.append({"type": "response.completed", "response": {
             "id": "r", "status": "completed", "output": [], "usage": {}}})
         fake_holder = {}
-        import urllib.request
-        orig = urllib.request.urlopen
+        orig = translate.open_request
         def fake_open(*a, **k):
             fake_holder["r"] = _FakeSSE(events)
             return fake_holder["r"]
-        urllib.request.urlopen = fake_open  # type: ignore
+        translate.open_request = fake_open  # type: ignore
         try:
             with self.assertRaises(translate.ClientGone):
                 translate.call_codex({}, {}, on_delta=lambda f: False)
             self.assertTrue(fake_holder["r"].closed)  # upstream read stopped
         finally:
-            urllib.request.urlopen = orig  # type: ignore
+            translate.open_request = orig  # type: ignore
+
+    def test_silent_provider_cancellation_bounded_by_poll(self) -> None:
+        """A dead client is noticed while the provider is silent, not
+        only at the next SSE event boundary."""
+        import threading
+        import time
+
+        release = threading.Event()
+
+        class Blocking(_FakeSSE):
+            def readline(self, limit=-1):
+                release.wait(10)
+                return b""
+
+            def close(self):  # like a socket shutdown unblocking recv
+                super().close()
+                release.set()
+
+        fake = Blocking([])
+        calls = {"n": 0}
+
+        def check():
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                raise translate.RequestCancelled()
+
+        orig = translate.open_request
+        translate.open_request = lambda *a, **k: fake  # type: ignore
+        try:
+            rec: dict = {}
+            started = time.monotonic()
+            with self.assertRaises(translate.RequestCancelled):
+                translate.call_codex({}, rec, check_cancelled=check)
+            elapsed = time.monotonic() - started
+        finally:
+            release.set()
+            translate.open_request = orig  # type: ignore
+        self.assertLess(elapsed, 3.0)
+        self.assertTrue(rec.get("client_gone"))
+        self.assertTrue(fake.closed)
+        self.assertFalse(any(t.name == "fusion-sse-reader"
+                             for t in threading.enumerate()))
 
     def test_reasoning_items_stashed_for_next_turn(self) -> None:
         events = [{"type": "response.completed", "response": {
@@ -427,17 +467,16 @@ class LogPrivacyTest(unittest.TestCase):
                   {"type": "response.completed", "response": {
                       "id": "r", "status": "completed", "output": [],
                       "usage": {}}}]
-        import urllib.request
         fake = _FakeSSE(events)
-        orig = urllib.request.urlopen
+        orig = translate.open_request
         orig_auth = translate.auth.get_token
-        urllib.request.urlopen = lambda *a, **k: fake  # type: ignore
+        translate.open_request = lambda *a, **k: fake  # type: ignore
         translate.auth.get_token = lambda: ("t", "a")  # type: ignore
         try:
             translate.call_codex({"prompt_cache_key": "k"}, rec,
                                  on_delta=lambda f: True)
         finally:
-            urllib.request.urlopen = orig  # type: ignore
+            translate.open_request = orig  # type: ignore
             translate.auth.get_token = orig_auth  # type: ignore
         self.assertNotIn(self.MARKER, json.dumps(rec))
         self.assertEqual(rec["delta_chars"], len(self.MARKER))
@@ -494,7 +533,8 @@ class RelayToolLoopTest(unittest.TestCase):
         """Patch call_codex; each entry is one response's output items."""
         calls: list[dict] = []
 
-        def fake(body, rec, on_delta=None, timeout=0, _items_out=None):
+        def fake(body, rec, on_delta=None, timeout=0, _items_out=None,
+                 serialized=None):
             calls.append(json.loads(json.dumps(body)))
             items = outputs[len(calls) - 1]
             if _items_out is not None:

@@ -1,0 +1,6 @@
+test_create_load_subprocess_decrypt_and_delete (tests.test_keychain_live.TestLiveKeychain) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.232s
+
+OK

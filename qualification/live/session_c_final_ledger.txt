@@ -1,0 +1,2 @@
+final ledger: heads 13 turns [('offered', 20)] ops [('failed', 2), ('succeeded', 21)] epochs [('history_divergence', 2), ('legacy_history', 2)]
+open accounting runs: 0

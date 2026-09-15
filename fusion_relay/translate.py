@@ -38,6 +38,8 @@ import copy
 import hashlib
 import json
 import math
+import queue
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -46,6 +48,12 @@ from typing import Callable, Iterator, Optional
 
 from . import auth
 from .lifecycle import RequestCancelled
+from .payload_budget import (MAX_ERROR_BODY_BYTES, PayloadReport,
+                             RECOVERY_INSTRUCTION, UpstreamRejection,
+                             classify_upstream_error, measure_body,
+                             serialize_and_check)
+from .response_assembly import ResponseAssembly
+from .transport import open_request
 from .usage import normalized_usage, record_usage
 from .wire import Message, decode, end_stream, field, frame, iter_frames, text
 
@@ -139,6 +147,38 @@ class IncompleteResponse(RuntimeError):
 
 class ClientGone(RequestCancelled):
     """The CLI disconnected mid-stream; abort the upstream read."""
+
+
+_REJECTION_ORIGIN = {
+    'image_count': 'upstream_image_count',
+    'image_dimensions_or_format': 'upstream_image_format',
+    'context_limit': 'upstream_context_limit',
+    'payload_too_large': 'upstream_payload_too_large',
+    'unknown_upstream_rejection': 'upstream_unknown',
+}
+
+
+class UpstreamRejected(RuntimeError):
+    """The provider rejected the request with a classified HTTP error.
+
+    Carries only a bounded, content-free ``UpstreamRejection`` — the raw
+    error body is inspected for classification then discarded.
+    """
+
+    def __init__(self, status: int, rejection: UpstreamRejection):
+        super().__init__(f"codex HTTP {status}")
+        self.status = status
+        self.rejection = rejection
+
+    def user_message(self) -> str:
+        r = self.rejection
+        if r.classification != 'unknown_upstream_rejection':
+            return ("provider rejected request (HTTP %d, classification "
+                    "%s, certainty %s). %s" % (
+                        self.status, r.classification, r.certainty,
+                        RECOVERY_INSTRUCTION))
+        return ("upstream request failed (HTTP %d); the rejecting layer "
+                "is not established" % self.status)
 
 
 @dataclass
@@ -443,12 +483,107 @@ def _final_message(complete: dict, items: list[dict], rec: dict,
     return result
 
 
+def _visible_terminal_content(items: list[dict]) -> tuple:
+    """Project supported completed message content without losing refusals."""
+    if not isinstance(items, list):
+        raise IncompleteResponse("invalid terminal output")
+    chunks = []
+    refused = False
+    present = False
+    for item in items:
+        if not isinstance(item, dict):
+            raise IncompleteResponse("invalid terminal output item")
+        if item.get("type") != "message":
+            continue
+        content = item.get("content", [])
+        if not isinstance(content, list):
+            raise IncompleteResponse("invalid message content")
+        for part in content:
+            if not isinstance(part, dict):
+                raise IncompleteResponse("invalid message content")
+            kind = part.get("type")
+            if kind not in ("output_text", "refusal"):
+                raise IncompleteResponse("unsupported message content")
+            value = part.get("refusal" if kind == "refusal" else "text")
+            if not isinstance(value, str):
+                raise IncompleteResponse("invalid message content")
+            present = True
+            refused = refused or kind == "refusal"
+            chunks.append(value)
+    return present, "".join(chunks), refused
+
+
+# How often a blocked SSE read yields to the cancellation callback. The
+# provider may emit nothing for tens of seconds mid-reasoning; without
+# this a dead client is only noticed at the next event boundary.
+CANCEL_POLL_S = 0.5
+
+
+class _LineReader:
+    """Read SSE lines on a daemon thread so the request thread can poll
+    ``check_cancelled`` every ``CANCEL_POLL_S`` while the provider is
+    silent. Line semantics (limits, EOF, errors) are unchanged: EOF is
+    delivered as ``b""`` and a reader exception is re-raised in the
+    consumer. ``abort()`` shuts the socket down so the blocked reader
+    exits promptly; provider-side cancellation is still unconfirmed.
+    """
+
+    _EOF = object()
+
+    def __init__(self, response):
+        self._response = response
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="fusion-sse-reader")
+        self._thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                line = self._response.readline(MAX_SSE_LINE + 1)
+                if not line:
+                    self._queue.put(self._EOF)
+                    return
+                self._queue.put(line)
+        except BaseException as e:  # delivered to the consumer
+            self._queue.put(e)
+
+    def next(self, check) -> bytes:
+        while True:
+            try:
+                item = self._queue.get(timeout=CANCEL_POLL_S)
+            except queue.Empty:
+                check()
+                continue
+            if item is self._EOF:
+                return b""
+            if isinstance(item, BaseException):
+                raise item
+            return item
+
+    def abort(self) -> None:
+        """Best-effort: unblock the reader and reclaim the thread."""
+        sock = getattr(getattr(getattr(self._response, "fp", None),
+                               "raw", None), "_sock", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        try:
+            self._response.close()
+        except Exception:
+            pass
+        self._thread.join(timeout=2.0)
+
+
 def call_codex(body: dict, rec: dict,
                on_delta: Optional[Callable[[bytes], bool]] = None,
                timeout: int = 300,
                _items_out: Optional[list] = None,
                check_cancelled: Optional[Callable[[], None]] = None,
-               credentials: Optional[tuple] = None) -> bytes:
+               credentials: Optional[tuple] = None,
+               serialized: Optional[bytes] = None) -> bytes:
     """Call the Codex Responses endpoint; return the complete wire stream.
 
     If *on_delta* is given it is invoked once per assistant text delta with a
@@ -488,16 +623,18 @@ def call_codex(body: dict, rec: dict,
             "Accept": "text/event-stream",
             "User-Agent": "fusion-codex-relay/0.2",
         }
+        data = serialized if serialized is not None \
+            else json.dumps(body).encode()
+        rec["final_serialized_bytes"] = len(data)
         req = urllib.request.Request(CODEX_RESPONSES_URL,
-                                     data=json.dumps(body).encode(),
+                                     data=data,
                                      headers=headers)
-        complete: Optional[dict] = None
-        items: list[dict] = []
+        assembly = ResponseAssembly(IncompleteResponse)
         text_parts: list[str] = []
         total_bytes = 0
         try:
             request_started = True
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            with open_request(req, timeout=timeout) as response:
                 rec["codex_http_status"] = response.status
                 quota = {}
                 for k in QUOTA_HEADERS:
@@ -510,67 +647,102 @@ def call_codex(body: dict, rec: dict,
                         quota[k] = v
                 if quota:
                     rec["codex_quota_snapshot"] = quota
-                while True:
-                    check()
-                    line = response.readline(MAX_SSE_LINE + 1)
-                    total_bytes += len(line)
-                    if len(line) > MAX_SSE_LINE or \
-                            total_bytes > MAX_RESPONSE_BYTES:
-                        raise RuntimeError("codex stream oversized")
-                    if not line:
-                        break
-                    if not line.startswith(b"data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == b"[DONE]":
-                        continue
-                    event = json.loads(data)
-                    etype = event.get("type")
-                    if etype == "response.output_item.done":
-                        items.append(event["item"])
-                    elif etype == "response.output_text.delta":
-                        delta = event.get("delta", "")
-                        if delta:
-                            text_parts.append(delta)
-                            rec["delta_chars"] = rec.get("delta_chars", 0) + len(delta)
-                            if on_delta and on_delta(frame(field(3, delta))) is False:
-                                response.close()
-                                raise ClientGone()
-                    elif etype == "response.completed":
-                        complete = event["response"]
-                        _record_usage(complete, rec)
-                        usage_recorded = True
-                    elif etype == "response.incomplete":
-                        partial = event.get("response") or {}
-                        reason = (partial.get("incomplete_details") or {}).get(
-                            "reason")
-                        detail = reason if reason in _SAFE_INCOMPLETE \
-                            else "unknown"
-                        rec["incomplete_reason"] = detail
-                        _record_usage(partial, rec)
-                        usage_recorded = True
-                        raise IncompleteResponse(
-                            f"codex response incomplete: {detail}")
-                    elif etype in ("error", "response.failed"):
-                        _record_usage(event.get("response") or {}, rec)
-                        usage_recorded = True
-                        raise RuntimeError("codex stream failed")
+                lines = _LineReader(response)
+                try:
+                    while True:
+                        check()
+                        line = lines.next(check)
+                        total_bytes += len(line)
+                        if len(line) > MAX_SSE_LINE or \
+                                total_bytes > MAX_RESPONSE_BYTES:
+                            raise RuntimeError("codex stream oversized")
+                        if not line:
+                            break
+                        if not line.startswith(b"data: "):
+                            continue
+                        if not line.endswith(b"\n"):
+                            raise IncompleteResponse("unterminated event")
+                        data = line[6:].strip()
+                        if data == b"[DONE]":
+                            continue
+                        try:
+                            event = json.loads(data)
+                        except (ValueError, UnicodeDecodeError):
+                            raise IncompleteResponse("invalid event data")
+                        if not isinstance(event, dict):
+                            raise IncompleteResponse("invalid event data")
+                        etype = event.get("type")
+                        if etype == "response.incomplete":
+                            partial = event.get("response")
+                            if not isinstance(partial, dict):
+                                raise IncompleteResponse("invalid event data")
+                            details = partial.get("incomplete_details")
+                            if details is not None \
+                                    and not isinstance(details, dict):
+                                raise IncompleteResponse("invalid event data")
+                            reason = (details or {}).get("reason")
+                            detail = reason if reason in _SAFE_INCOMPLETE \
+                                else "unknown"
+                            rec["incomplete_reason"] = detail
+                            if not usage_recorded:
+                                _record_usage(partial, rec)
+                                usage_recorded = True
+                            raise IncompleteResponse(
+                                f"codex response incomplete: {detail}")
+                        elif etype in ("error", "response.failed"):
+                            partial = event.get("response")
+                            if partial is not None \
+                                    and not isinstance(partial, dict):
+                                raise IncompleteResponse("invalid event data")
+                            if not usage_recorded:
+                                _record_usage(partial or {}, rec)
+                                usage_recorded = True
+                            raise RuntimeError("codex stream failed")
+                        else:
+                            if etype == "response.completed" \
+                                    and not usage_recorded:
+                                partial = event.get("response")
+                                if not isinstance(partial, dict):
+                                    raise IncompleteResponse(
+                                        "invalid event data")
+                                _record_usage(partial, rec)
+                                usage_recorded = True
+                            delta = assembly.accept(event)
+                            if assembly.refused:
+                                rec["response_refused"] = True
+                            if delta:
+                                text_parts.append(delta)
+                                rec["delta_chars"] = rec.get("delta_chars", 0) \
+                                    + len(delta)
+                                if on_delta and on_delta(
+                                        frame(field(3, delta))) is False:
+                                    response.close()
+                                    raise ClientGone()
+                finally:
+                    lines.abort()
         except urllib.error.HTTPError as e:
+            try:
+                raw = e.read(MAX_ERROR_BODY_BYTES + 1)
+            except (OSError, ValueError, AttributeError):
+                raw = b""
+            rejection = classify_upstream_error(e.code, raw)
             rec["codex_http_status"] = e.code
             rec["error_category"] = "upstream_error"
+            rec["rejection_origin"] = _REJECTION_ORIGIN.get(
+                rejection.classification, 'upstream_unknown')
             e.close()
-            raise RuntimeError(f"codex HTTP {e.code}")
-        if complete is None:
-            raise RuntimeError("codex stream ended without response.completed")
+            raise UpstreamRejected(e.code, rejection)
+        complete, output_items = assembly.finish()
         check()
-        output_items = complete.get("output", []) or items
+        if assembly.refused:
+            rec["response_refused"] = True
         _stash_reasoning(body.get("prompt_cache_key", ""), output_items)
         if _items_out is not None:
             _items_out.extend(output_items)
         out = b""
         if on_delta is None and text_parts:
             out += frame(field(3, "".join(text_parts)))
-        out += frame(_final_message(complete, items, rec)) + end_stream()
+        out += frame(_final_message(complete, output_items, rec)) + end_stream()
         return out
     except RequestCancelled:
         rec["client_gone"] = True
@@ -589,7 +761,8 @@ def call_codex_with_tools(body: dict, rec: dict,
                           *, journal=None,
                           operation_scope: str = "",
                           check_cancelled: Optional[Callable[[], None]] = None,
-                          credentials: Optional[tuple] = None) -> bytes:
+                          credentials: Optional[tuple] = None,
+                          budget_profile=None) -> bytes:
     """Like call_codex, but executes relay-owned tool calls internally.
 
     ``executor(call_item, rec) -> result_text`` runs a relay-owned call.
@@ -650,9 +823,25 @@ def call_codex_with_tools(body: dict, rec: dict,
 
     for _ in range(max_loops):
         check()
+        serialized = None
+        if budget_profile is not None:
+            # Re-measure every iteration: the body grows as relay-owned
+            # call+output pairs are appended, so a budget that fit on
+            # iteration 1 can be exceeded by iteration 2.
+            report = rec.get('_payload_report')
+            if report is None:
+                report = PayloadReport(
+                    route='codex', profile=budget_profile.profile)
+                rec['_payload_report'] = report
+            measure_body(body, budget_profile, report)
+            try:
+                serialized = serialize_and_check(
+                    body, budget_profile, report)
+            finally:
+                rec['payload'] = report.safe_dict()
         items: list[dict] = []
         tail = call_codex(body, rec, on_delta=on_delta, _items_out=items,
-                          **call_kwargs)
+                          serialized=serialized, **call_kwargs)
         check()
         calls = [it for it in items if it.get("type") == "function_call"]
         # Every call id in the response must map to one fingerprint before

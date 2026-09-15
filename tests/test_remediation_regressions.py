@@ -62,7 +62,8 @@ class ToolLoopBudgetTest(unittest.TestCase):
         translate.call_codex = self._orig  # type: ignore[assignment]
 
     def test_budget_exhausted_raises_and_stashes_result(self) -> None:
-        def fake(body, rec, on_delta=None, timeout=0, _items_out=None):
+        def fake(body, rec, on_delta=None, timeout=0, _items_out=None,
+                 **_ignored):
             if _items_out is not None:
                 _items_out.append({
                     "type": "function_call", "call_id": "c1",

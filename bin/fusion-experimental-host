@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""EXPERIMENTAL launcher-provenance durable-continuation host."""
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+from fusion_relay.experimental_host import main
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -211,10 +211,8 @@ class CuaRuntimeAdapter:
         self.tools_schema_hash = hashlib.sha256(
             json.dumps(tools, sort_keys=True).encode()).hexdigest()
 
-    def close(self) -> None:
-        self._dead = True
-        self._kill_group()
-        # handles released only after the group is confirmed gone
+    def _close_handles(self) -> None:
+        """Release local handles even when child termination is uncertain."""
         if self._sel is not None:
             try:
                 self._sel.close()
@@ -222,18 +220,36 @@ class CuaRuntimeAdapter:
                 pass
             self._sel = None
         proc = self._proc
-        if proc is not None and proc.poll() is not None:
-            for f in (proc.stdin, proc.stdout):
-                try:
-                    f.close()
-                except Exception:
-                    pass
-            self._proc = None
+        if proc is not None:
+            for stream in (proc.stdin, proc.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
+    def close(self) -> None:
+        self._dead = True
+        confirmed = False
+        try:
+            self._kill_group()
+            confirmed = True
+        finally:
+            self._close_handles()
+            # Retain identity for reconciliation if termination failed.
+            # Closing handles is NOT proof that the process/action stopped.
+            if confirmed:
+                # handles released only after the group is confirmed gone
+                self._proc = None
 
     def _abort(self) -> None:
-        """Mark dead and terminate the owned group. Never retried."""
+        """Dead adapter, bounded termination, unconditional handle cleanup."""
         self._dead = True
-        self._kill_group()
+        try:
+            self._kill_group()
+        finally:
+            self._close_handles()
+        # Preserve the reaped process object for existing diagnostic callers.
 
     def _kill_group(self) -> None:
         """TERM (5s) then KILL (5s) then confirm the group is empty.

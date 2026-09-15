@@ -38,6 +38,24 @@ def _tail_for(items):
     return wire.frame(msg) + wire.end_stream()
 
 
+
+def _ldb1(led, sql, params=()):
+    """Locked single-row access — /usr/bin/python3 3.9 sqlite3 crashes
+    on concurrent statements on one connection; hold the ledger lock."""
+    with led._lock:
+        return led._db.execute(sql, params).fetchone()
+
+
+def _ldba(led, sql, params=()):
+    with led._lock:
+        return led._db.execute(sql, params).fetchall()
+
+
+def _ldbw(led, sql, params=()):
+    with led._lock:
+        return led._db.execute(sql, params)
+
+
 class _Queued:
     """Patch translate.call_codex with per-iteration canned outputs."""
 
@@ -154,7 +172,7 @@ class OperationJournalTest(unittest.TestCase):
     def test_executing_row_reports_outcome_unknown(self):
         import hashlib
         fp = hashlib.sha256(json.dumps(["n", "{}"]).encode()).hexdigest()
-        self.journal._db.execute(
+        _ldbw(self.journal,
             "INSERT INTO operations(scope,operation_id,fingerprint,status) "
             "VALUES('s1','cx',?,'executing')", (fp,))
         self.assertEqual(
@@ -465,15 +483,14 @@ class UsageRecordingTest(unittest.TestCase):
         translate.auth.get_token = self._auth
 
     def _run_into(self, rec, events):
-        import urllib.request
         from test_relay import _FakeSSE
         fake = _FakeSSE(events)
-        orig = urllib.request.urlopen
-        urllib.request.urlopen = lambda *a, **k: fake
+        orig = translate.open_request
+        translate.open_request = lambda *a, **k: fake
         try:
             return translate.call_codex({"prompt_cache_key": "k"}, rec)
         finally:
-            urllib.request.urlopen = orig
+            translate.open_request = orig
 
     def test_unknown_usage_omits_wire_field7(self):
         msg = translate._final_message(

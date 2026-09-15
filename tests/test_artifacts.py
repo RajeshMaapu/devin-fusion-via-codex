@@ -35,6 +35,24 @@ def make_png(w=2, h=2, color=6, filt=0, extra_raw=b"",
     return sig + ihdr + idat + _chunk(b"IEND", b"")
 
 
+
+def _ldb1(led, sql, params=()):
+    """Locked single-row access — /usr/bin/python3 3.9 sqlite3 crashes
+    on concurrent statements on one connection; hold the ledger lock."""
+    with led._lock:
+        return led._db.execute(sql, params).fetchone()
+
+
+def _ldba(led, sql, params=()):
+    with led._lock:
+        return led._db.execute(sql, params).fetchall()
+
+
+def _ldbw(led, sql, params=()):
+    with led._lock:
+        return led._db.execute(sql, params)
+
+
 class _Clock:
     def __init__(self):
         self.t = 5000.0
@@ -241,8 +259,8 @@ class StoreTest(unittest.TestCase):
             small.put_png("s", "o2", make_png(4, 4))
         # existing artifact untouched
         self.assertTrue((small._root / "artifacts.db").exists())
-        rows = small._db.execute(
-            "SELECT COUNT(*) FROM artifacts").fetchone()[0]
+        rows = _ldb1(
+            small, "SELECT COUNT(*) FROM artifacts")[0]
         self.assertEqual(rows, 1)
 
     def test_concurrent_puts_unique_refs(self):

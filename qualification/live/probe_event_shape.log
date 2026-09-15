@@ -1,0 +1,20 @@
+HTTP 200
+response.created output_index= None item_type= None item_id_present= False enc= False
+response.in_progress output_index= None item_type= None item_id_present= False enc= False
+response.output_item.added output_index= 0 item_type= function_call item_id_present= True enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.delta output_index= 0 item_type= None item_id_present= False enc= False
+response.function_call_arguments.done output_index= 0 item_type= None item_id_present= False enc= False
+response.output_item.done output_index= 0 item_type= function_call item_id_present= True enc= False
+response.completed output_index= None item_type= None item_id_present= False enc= False
+TERMINAL output len 0 []
+usage {'attribution': {'items': {'msg_07769eaa6711ce69016aa8a6dad13887d085a7c52f9afcaa43': {'cache_write_tokens': 0, 'cached_tokens': 0, 'content': [{'cache_write_tokens': 0, 'cached_tokens': 0, 'input_tokens': 24, 'output_tokens': 0}], 'input_tokens': 24, 'output_tokens': 0}, 'fc_07769eaa6711ce69016aa8a6dc16d087d09f8d16d010ec3fe1': {'cache_write_tokens': 0, 'cached_tokens': 0, 'input_tokens': 2, 'output_tokens': 23}}, 'request_fields': {'tools': {'cache_write_tokens': 0, 'cached_tokens': 0, 'input_tokens': 34, 'output_tokens': 0}, 'instructions': {'cache_write_tokens': 0, 'cached_tokens': 0, 'input_tokens': 12, 'output_tokens': 0}}}, 'input_tokens': 72, 'input_tokens_details': {'cache_write_tokens': 0, 'cached_tokens': 0}, 'output_tokens': 23, 'output_tokens_details': {'reasoning_tokens': 0}, 'total_tokens': 95} status completed

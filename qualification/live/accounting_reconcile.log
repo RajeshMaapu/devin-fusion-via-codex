@@ -1,0 +1,44 @@
+{
+  "providers": {
+    "codex": {
+      "responses": 14,
+      "known": {
+        "input_tokens": 184666,
+        "output_tokens": 3117,
+        "cached_tokens": 0,
+        "reasoning_tokens": 2301
+      },
+      "missing": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0
+      },
+      "pending": 0
+    },
+    "native": {
+      "responses": 8,
+      "known": {
+        "input_tokens": 13331,
+        "output_tokens": 2792,
+        "cached_tokens": 10518,
+        "reasoning_tokens": null
+      },
+      "missing": {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 2,
+        "reasoning_tokens": 8
+      },
+      "pending": 0
+    }
+  },
+  "partial": true,
+  "degraded": false,
+  "coverage": "partial",
+  "gap_count": 0,
+  "unclean_runs": 0,
+  "reconciliation_required": false,
+  "pending_exports": 0,
+  "last_durable_write": 1789439444.177431
+}

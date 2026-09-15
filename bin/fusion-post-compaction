@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""PostCompaction hook forwarder for the fusion relay.
+
+Reads the hook JSON on stdin, extracts ONLY ``session_id`` (everything
+else — especially the summary — is discarded), and POSTs a bounded note
+to the relay's /host/compaction endpoint. Whether the hook session id
+matches the wire session field is unverified; the relay correlates by
+hash and fails closed on a mismatch. A hook must never block the CLI:
+this always exits 0 and prints nothing.
+"""
+import json
+import os
+import pathlib
+import sys
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+
+def main() -> int:
+    try:
+        from fusion_relay.identity import PrivateDirectory
+        from fusion_relay.launcher import DATA_DIR, _env_port, _read_token
+
+        payload = json.loads(sys.stdin.read(1 << 16))
+        session_id = payload.get("session_id") \
+            if isinstance(payload, dict) else None
+        if not isinstance(session_id, str) or not session_id:
+            return 0
+        summary_present = isinstance(payload, dict) and \
+            payload.get("summary") is not None
+        with PrivateDirectory(DATA_DIR) as private:
+            token = _read_token(private)
+        body = json.dumps({
+            "protocol_version": 1,
+            "session_id": session_id,
+            "summary_present": summary_present}).encode()
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/t/%s/host/compaction"
+            % (_env_port(), token),
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        urllib.request.urlopen(req, timeout=2).close()
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
